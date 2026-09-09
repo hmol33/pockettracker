@@ -149,10 +149,17 @@ class InputDispatcher {
      * ⚠️ **C7 NEEDS THIS AND THE PIXEL COMPARISON CANNOT ANSWER IT.** The shell skips drawing on an
      * idle frame, and the safety net under that decision is a byte-compare of the drawn frame — but a
      * frame that is never drawn is never compared. So anything that changes the SCREEN on a TIMER,
-     * with no input at all, is invisible to that net: BOTH status lines auto-dismiss 5 s after they
-     * are set (`run_due_status_dismiss`), and without this query a "PROJECT SAVED" — or a "FILE TOO
-     * BIG" on the browser's own bar — would sit on a quiescent screen forever, cleared in the state
-     * and stale in the pixels.
+     * with no input at all, is invisible to that net: BOTH status lines auto-dismiss after
+     * `STATUS_DISMISS_MS` (`run_due_status_dismiss`), and without this query a "PROJECT SAVED" — or a
+     * "FILE TOO BIG" on the browser's own bar — would sit on a quiescent screen forever, cleared in
+     * the state and stale in the pixels.
+     *
+     * ⚠️⚠️ **IT GOES FALSE ON THE FRAME THE WORK COMPLETES, AND THAT FRAME IS THE ONE THAT HAS TO BE
+     * DRAWN.** `set_now()` clears the message and its deadline together, so a gate that asks this
+     * question afterwards closes on exactly the frame that would have erased the message — which is
+     * how "PROJECT SAVED" came to sit on a still screen until the next button press, on both
+     * platforms. The caller owes this an active→idle EDGE, the way it already owes one to audio; the
+     * shell's `timedWorkEdge` is that, and the comment at the gate is where the reasoning lives.
      *
      * Derived from the DEADLINES themselves rather than from a flag any caller has to set — the same
      * rule that made the dismissal watch the message field instead of trusting its 22 assignment
@@ -462,8 +469,91 @@ class InputDispatcher {
     struct RenderHooks {
         std::function<void(bool)> suspend_audio;
         std::function<void()>     repaint;
+
+        /**
+         * ⭐ **THE THIRD ONE, AND IT IS A LOAD'S, NOT A RENDER'S** (see `begin_load` below).
+         *
+         * "Drain whatever the platform has queued, and tell me whether the user asked to stop." It is
+         * what makes a load cancellable, and what keeps the app's lifecycle alive while one runs.
+         *
+         * ⚠️⚠️ **IT DOES NOT DISPATCH THE PRESSES IT DRAINS, AND THAT IS THE POINT.** Every button
+         * except a cancel is CONSUMED. Without it a load's queued input is not lost, it is REPLAYED:
+         * SDL keeps the presses, and they all arrive at once when the load ends, onto whatever screen
+         * it returned to. That is still true of EXPORT today.
+         *
+         * ⚠️ It is also the only reason `SDL_APP_WILLENTERBACKGROUND` is seen during a load at all —
+         * the watcher that flushes the crash-recovery autosave fires from inside the platform's own
+         * pump, so a frame loop that has stopped polling has silently switched that machinery off.
+         */
+        std::function<bool()> load_pump;
     };
     void set_render_hooks(RenderHooks hooks) { render_ = std::move(hooks); }
+
+    // ═════════════════════════════════════════════════════════════════════════════════════════════
+    // A SLOW LOAD
+    // ═════════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // Opening a file is the one thing the app does that can outlast a frame. Most loads do not — a
+    // 106 MB `.sf2` takes a quarter of a second, every `.wav` is a read — but a compressed `.sf3` is
+    // unpacked one sample at a time and a long mp3 in proportion to its length, and there the loop is
+    // inside the load rather than running.
+    //
+    // ⚠️ **THE APP NEVER PREDICTS WHETHER A FILE IS BIG.** `begin_load` starts a clock; the strip goes
+    // up only if the load is still running after `LOADING_DELAY_MS`. ⭐ Which is also what makes
+    // it right on a slow device with no second number in it: a file that is instant on a desktop
+    // crosses the delay on a handheld and gets a strip there and only there.
+
+    /** The wait before a running load is drawn. Below it a strip would flash and be worse than none. */
+    static constexpr int LOADING_DELAY_MS = 400;
+
+    /**
+     * How long a status message stays up before it clears itself (`run_due_status_dismiss`).
+     *
+     * ⚠️ **3 s, and it is a DEPARTURE from Kotlin's 5 s (MainActivity's two status LaunchedEffects) —
+     * asked for from the device.** Five seconds is long enough that the message is still sitting there
+     * two or three actions later, reporting on something the user has already moved on from, and it
+     * reads as stuck rather than as slow. Nothing measures this window; it is a judgement about
+     * reading speed, and it is the user's.
+     *
+     * Public so a check can be written against the WINDOW rather than against a number typed twice.
+     */
+    static constexpr long long STATUS_DISMISS_MS = 3000;
+
+    /**
+     * How often the strip is redrawn and the buttons are read while a load runs.
+     *
+     * ⚠️⚠️ **NOT "on every report", and the difference is measured rather than tidy.** A soundfont
+     * reports once per sample header — 1628 times for a 43 MB `.sf3` — and each repaint is a full
+     * canvas draw and a present. Doing that per report made the load visibly slower than it was with
+     * no strip at all: the reporting cost more than the decoding. Thirty frames a second is more than a
+     * bar can use.
+     */
+    static constexpr int LOADING_REPAINT_MS = 33;
+
+    /**
+     * Open a load. `detail` is what the strip names — a file's display name, or a project's.
+     *
+     * ⚠️ Every `begin_load` needs its `end_load`, and every load path in the app is wrapped by
+     * `LoadScope` (input_dispatcher.cpp) rather than calling these by hand.
+     */
+    void begin_load(long long now_ms, std::string detail);
+
+    /**
+     * The report from inside the load, called by the sink the shell installs into `pt::set_load_tick`.
+     * **Returns false when the user has cancelled**, which is what the engine unwinds on.
+     *
+     * ⚠️ THE TIME IS PASSED IN rather than taken from `set_now()`, and that is deliberate rather than
+     * tidy: `set_now` also RUNS DUE WORK, and the 3 s autosave firing from inside a project load
+     * would write the crash-recovery file from a document that is half-loaded. A tick moves the
+     * clock the strip reads and nothing else.
+     */
+    bool load_tick(long long now_ms, float fraction);
+
+    /** Close it. Leaves `loading` clear whether the load finished, failed or was cancelled. */
+    void end_load();
+
+    /** Is a load in flight? The shell asks before it does anything that assumes a settled document. */
+    bool load_running() const { return s_.loading.running; }
 
     /**
      * Open the MIDI port the settings name, once, at boot — call it after `AppState::midiOut` is set
@@ -518,6 +608,22 @@ class InputDispatcher {
     songcore::SongcoreHost& host_;
     FileSystem&             fs_;
     long long               now_ms_ = 0;
+    // ── TAP TEMPO (PROJECT > TEMPO, plain A) ─────────────────────────────────────────────────────
+    /** How many gaps between taps are averaged. Four taps in, the number has settled. */
+    static constexpr int       TAP_TEMPO_KEEP       = 4;
+    /** A longer silence than this is a new count, not a gap. 3 s is one beat at 20 BPM — the slowest
+     *  tempo the row accepts, so nothing inside the legal range can be mistaken for a pause. */
+    static constexpr long long TAP_TEMPO_TIMEOUT_MS = 3000;
+    /** Under this and it is a bouncing button, not a tap: 60 ms is 1000 BPM, past the row's ceiling. */
+    static constexpr long long TAP_TEMPO_MIN_MS     = 60;
+    long long tapTempoLastMs_ = 0;                    // 0 = no tap yet this count
+    long long tapTempoGaps_[TAP_TEMPO_KEEP] = {0};    // a ring of the most recent gaps, in ms
+    int       tapTempoCount_ = 0;                     // how many of them are filled (capped at KEEP)
+
+    /** When the load in flight opened — what `LOADING_DELAY_MS` is measured from. */
+    long long               loadStartMs_ = 0;
+    /** …and when it was last drawn, which is what `LOADING_REPAINT_MS` paces. */
+    long long               lastLoadPaintMs_ = 0;
     RenderHooks             render_{};
 
     /** See set_media_base_dir. Empty means "relative paths stay relative" (resolve_media_path). */
@@ -598,15 +704,12 @@ class InputDispatcher {
     std::string statusLastSeen_{};
     long long   statusDismissAtMs_ = 0;
 
-    // The FILE BROWSER's line, on the same 5 s window. ⚠️ A SEPARATE PAIR, and not for tidiness:
+    // The FILE BROWSER's line, on the same window. ⚠️ A SEPARATE PAIR, and not for tidiness:
     // feeding both message fields through ONE pair stops the dismissal working at all — `lastSeen`
     // then thrashes between two different strings and re-arms the deadline on every frame, so
     // neither line ever expires. (Measured; §34's own checks are what go red.)
     std::string browserStatusLastSeen_{};
     long long   browserStatusDismissAtMs_ = 0;
-
-    /** 5 s — Kotlin's own delay (MainActivity's two status LaunchedEffects). */
-    static constexpr long long STATUS_DISMISS_MS = 5000;
 
     /** The watchers and the deadlines, all run once a frame by set_now(). */
     void run_due_status_dismiss();
@@ -814,8 +917,8 @@ class InputDispatcher {
     // ── FX helper ───────────────────────────────────────────────────────────────────────────────
     /** True when the cursor is on an FX-TYPE column (PHRASE 4/6/8, TABLE 3/5/7). */
     bool on_fx_type_column() const;
-    /** The index into EFFECT_TYPES the cursor's FX column currently holds. */
-    int  current_fx_type_index() const;
+    /** The effect CODE the cursor's FX column currently holds — where the picker opens. */
+    int  current_fx_type_code() const;
     /** Write an effect CODE into the FX column under the cursor. */
     void apply_fx_type_change(int effect_code);
 
@@ -857,6 +960,7 @@ class InputDispatcher {
         EQ        = 1u << 3,
         FX_HELPER = 1u << 4,
         BROWSER   = 1u << 5,
+        LOADING   = 1u << 6,
     };
 
     friend constexpr Overlay operator|(Overlay a, Overlay b) {
@@ -872,6 +976,14 @@ class InputDispatcher {
      * construction, which is exactly why it was free to drift before it lived in one function.
      */
     Overlay top_overlay() const {
+        // ⚠️ FIRST, above even the confirm dialog. A load is the one layer that can open while another
+        // modal is already up — the sample editor's LOAD is reached from behind its own confirm — and
+        // it is not dismissible by anything except finishing or being cancelled.
+        //
+        // ⚠️ `running`, not `shown`: a load owns the buttons from its first moment, whether or not it
+        // has been up long enough to have drawn anything. A press in the first 400 ms is not a press
+        // on the screen underneath.
+        if (s_.loading.running) return Overlay::LOADING;
         if (confirm_open())     return Overlay::CONFIRM;
         if (qwerty_open())      return Overlay::QWERTY;
         if (theme_open())       return Overlay::THEME;
@@ -1039,9 +1151,25 @@ class InputDispatcher {
      */
     void save_theme_as(const std::string& dir, const std::string& typed_text);
 
+    /** A on the SCALE screen's NAME row: column 1 = SAVE, column 2 = LOAD. Column 0 cycles on A+DPAD. */
+    void scale_row_action();
+
+    /** Apply the typed name and write `<dir>/<name>.pts`. The QWERTY's SCALE_SAVE arm. */
+    void save_scale_as(const std::string& dir, const std::string& typed_text);
+
     // ── PROJECT + SETTINGS: the buttons (Phase 3 S7) ────────────────────────────────────────────
     /** A on PROJECT: SAVE / LOAD / NEW / MIX / STEMS / SEQ / INST / SETTINGS> / EXIT. */
     void project_action();
+
+    /**
+     * TAP TEMPO — one press of A on the TEMPO row, in time with what you want to hear.
+     *
+     * The tempo is the average of the last `TAP_TEMPO_KEEP` gaps rather than the last one alone: a
+     * single gap makes the number jump on every uneven tap, and a human tapping by feel is uneven.
+     * The FIRST tap sets no tempo — there is no gap yet to measure — and a gap longer than
+     * `TAP_TEMPO_TIMEOUT_MS` starts a fresh count rather than averaging in a pause.
+     */
+    void tap_tempo();
     /** A on SETTINGS: only THEME (row 9) and TEMPLATE (row 10) do anything — the rest are A+DPAD. */
     void settings_action();
 

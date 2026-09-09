@@ -12,6 +12,9 @@ Everything you can do with PocketTracker.
 - Select cells, rows, or entire screens and copy, cut, paste, or delete them (M8-style selection)
 - Set swing and shuffle per track or globally with groove patterns
 - Build up to 16 scales per project by switching each of the twelve notes on or off, and set the song's key. A track using a scale plays only the notes in it: anything out of the scale is moved to the nearest note that is in, both as you type and as the song plays, so a phrase written before you chose the scale falls into it. The scale screen marks the note being heard; sliced instruments are left alone, and any instrument can be taken out of transposition entirely with its TSP switch
+- Start from 38 built-in scales — the modes, the pentatonics, the bebop and diminished scales, and a set of Japanese and Indian ones — and save your own to `PocketTracker/Scales` as files you can rename, edit and carry between devices
+- Set the tempo by feel: RIGHT from the tempo value on the PROJECT screen reaches a TAP button — press A in time and the number follows your taps
+- Metronome: a click on every beat while the song plays, with its own volume (SETTINGS → METRONOME). It is there to play along to and is never written into an export
 - 256 phrases, 256 chains, 8 tracks, 128 grooves
 - Use HOP to jump between phrases mid-sequence — create odd time signatures and generative loops
 - Every track runs its own column of the song at its own pace: all 8 start together, then each moves on as soon as its own chain ends, so a 2-row chain beside a 16-row one loops eight times instead of waiting. A `>` marker on the song, chain and phrase screens shows where each track has got to
@@ -36,6 +39,13 @@ Write these into any phrase step to shape how a note plays:
 - **Reverb / delay send** — send a single note to the reverb or delay bus, independent of the instrument
 - **Filter cutoff / resonance** — move the instrument's own filter from a phrase step, on that note only;
   the same two cells work in a table, so a filter envelope can be written once per instrument
+- **Low-pass / high-pass / band-pass** — switch a filter *on* from a phrase step or a table row, at the
+  cutoff you name, on any instrument; all three can be swept with the automation pair
+- **Overdrive · bit crush · downsample** — the instrument's three dirt controls, written per note
+- **Fine tune** — the cents between the semitones, a semitone either way; it retunes a note that is
+  already playing, so a sweep of it is a glide
+- **Transpose multiplier** — set per step how far the chain and project transposes move a note: as
+  usual, further, not at all, or the opposite way, so one phrase can be reused across chains
 - **EQ (per note / mixer)** — apply an EQ preset to one note, or automate the master EQ across the song
 - **Chance** — probability gate: set odds the note actually plays
 - **Randomize** — randomize any other FX value on the fly
@@ -63,6 +73,7 @@ Each instrument has its own 16-row mini-sequencer. It loops continuously while t
 
 - **Sampler**: load any WAV, MP3, FLAC, OGG, Opus or M4A file (mono or stereo); set root note, detune, volume, pan
 - **SoundFont**: load SF2 and SF3 files; edit envelope (attack, decay, sustain, release), filter cutoff and resonance
+- Only the chosen sound is loaded out of a SoundFont, not the bank around it — SF2 and SF3 alike, so banks of hundreds of megabytes are usable; the list of sounds inside a file opens instantly
 - Loop modes: no loop, forward loop, ping-pong loop
 - Reverse playback
 - Non-destructive start and end point trimming
@@ -117,6 +128,8 @@ Record what's currently playing in the sequencer into a new sample — capture a
 - On-screen QWERTY keyboard for naming projects and files
 - Load a project while the sequencer is running — the new song takes over from its first row, so you
   can switch material mid-set
+- Slow loads show progress and can be stopped with B — large compressed soundfonts and long samples
+  report how far along they are; quick loads show nothing
 - Projects saved as .ptp files in `Projects/`, inside PocketTracker's home folder
 - Instruments saved as .pti files in `Instruments/`, beside it
 - Samples stored wherever you put them; paths stored in the project
@@ -131,6 +144,7 @@ Record what's currently playing in the sequencer into a new sample — capture a
 ## Controls
 
 - Help on SELECT: a tap describes the cell under the cursor in the visualizer strip
+- Effect picker: hold A on an FX type to browse the commands grouped by what they act on, reading what each one does before you let go
 - Song-relative navigation, on by default: B+D-pad walks the arrangement instead of the 00–FF pools, so the chain and phrase on screen are always the ones the song plays (SETTINGS → NAV = POOL restores the old behaviour)
 - Full physical button support (tested on Miyoo Flip and Ayaneo Pocket Air Mini)
 - Touch layout: virtual buttons in portrait orientation

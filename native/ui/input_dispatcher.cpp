@@ -8,6 +8,8 @@
 #include "ui/song_pointer.h"     // NAV = SONG — the pointer, the entry gate and the load-time clamp
 #include "ui/std_filesystem.h"   // path_name / path_stem / path_extension / to_lower
 #include "ui/theme_io.h"         // .ptt — save_theme_file / load_theme_file
+#include "ui/scale_io.h"         // .pts — save_scale_file / load_scale_file / the factory seed
+#include "load_progress.h"       // begin_load / end_load — where the engine reports a slow load
 
 #include <algorithm>
 #include <map>
@@ -24,6 +26,27 @@ using songcore::Phrase;
 using songcore::Project;
 
 namespace {
+
+/**
+ * One load, opened and closed.
+ *
+ * ⚠️ **RAII BECAUSE THE LOAD PATHS RETURN EARLY, AND SEVERAL OF THEM DO.** The browser's switch has
+ * four arms that `return` from inside it; a hand-written `end_load()` at the bottom would be missed
+ * by each of them and would leave `Overlay::LOADING` up forever — an app that has stopped taking
+ * input with nothing on screen that ever appeared to explain it.
+ */
+struct LoadScope {
+    LoadScope(InputDispatcher& d, long long now_ms, std::string detail) : d_(d) {
+        d_.begin_load(now_ms, std::move(detail));
+    }
+    ~LoadScope() { d_.end_load(); }
+
+    LoadScope(const LoadScope&)            = delete;
+    LoadScope& operator=(const LoadScope&) = delete;
+
+  private:
+    InputDispatcher& d_;
+};
 
 /** Chain.isEmpty(row) — the row holds no phrase. */
 bool chain_row_empty(const Chain& c, int row) { return c.phraseRefs[static_cast<size_t>(row)] == -1; }
@@ -103,9 +126,59 @@ void InputDispatcher::set_now(long long now_ms) {
     now_ms_ = now_ms;
     run_due_sample_preview_restore();   // the sample editor's 100 ms audition restore (S6b)
     run_due_autosave();                 // the crash-recovery autosave's 3 s debounce  (S10)
-    run_due_status_dismiss();           // the status line's 5 s auto-dismiss (parity finding 5)
+    run_due_status_dismiss();           // the status line's auto-dismiss (parity finding 5)
     run_instrument_entry_push();        // Android's on-entry instrument push (parity finding 8)
     run_selection_recency();            // which rung L+R takes first
+}
+
+// ─── A slow load ─────────────────────────────────────────────────────────────────────────────────
+
+void InputDispatcher::begin_load(long long now_ms, std::string detail) {
+    pt::begin_load();                 // clears the engine-side cancel flag; see load_progress.h
+    s_.loading = AppState::LoadingState{};
+    s_.loading.running = true;
+    s_.loading.detail  = std::move(detail);
+    loadStartMs_       = now_ms;
+    lastLoadPaintMs_   = now_ms;   // the first paint is one cadence in, never on the opening report
+}
+
+bool InputDispatcher::load_tick(long long now_ms, float fraction) {
+    if (!s_.loading.running) return true;   // a tick from a load nobody opened — nothing to draw on
+
+    s_.loading.progress  = fraction;
+    s_.loading.elapsedMs = static_cast<int>(now_ms - loadStartMs_);
+
+    // ⚠️ The strip is raised HERE and never at `begin_load`. Below the delay a load draws nothing at
+    // all — see LOADING_DELAY_MS. Once raised it stays up: a bar that vanishes because one file
+    // in a project happened to be quick is a flicker, not a report.
+    if (s_.loading.elapsedMs >= LOADING_DELAY_MS) s_.loading.shown = true;
+
+    // ⚠️⚠️ **THROTTLED, AND WITHOUT THIS THE STRIP MAKES THE LOAD IT IS REPORTING ON DRAMATICALLY
+    // SLOWER.** A report arrives per SAMPLE HEADER — measured, 1628 of them for a 43 MB `.sf3`,
+    // roughly one every 2.5 ms — and each repaint is a FULL canvas redraw plus a present. Painting
+    // every report turned a 4 s load into one still running after 6 s, with a bar that looked frozen
+    // because each frame advanced it by 0.06% (⅟₁₆₂₈ of the bar is a fifth of a pixel). The instrument
+    // was changing what it measured, and only a run of the real app could show it.
+    //
+    // ⭐ Thirty frames a second is more than a progress bar can use, and it puts the drawing back
+    // under the load instead of on top of it. The cancel rides the same cadence, so a press is seen
+    // within a frame — which is the same latency every other button in the app has.
+    if (now_ms - lastLoadPaintMs_ >= LOADING_REPAINT_MS) {
+        lastLoadPaintMs_ = now_ms;
+
+        // ⚠️ **THE PUMP COMES FIRST, AND IT IS WHAT MAKES THE FRAME WORTH DRAWING.** It is also the
+        // only thing keeping the app's lifecycle alive while a load runs — see `RenderHooks::load_pump`.
+        if (render_.load_pump && render_.load_pump()) s_.loading.cancelRequested = true;
+
+        if (s_.loading.shown && render_.repaint) render_.repaint();
+    }
+
+    return !s_.loading.cancelRequested;
+}
+
+void InputDispatcher::end_load() {
+    pt::end_load();
+    s_.loading = AppState::LoadingState{};
 }
 
 void InputDispatcher::run_instrument_entry_push() {
@@ -143,12 +216,12 @@ void InputDispatcher::flush_autosave() {
     autosave_write(host_, fs_);
 }
 
-// ─── The status line's 5 s auto-dismiss (MainActivity.kt:734–747) ────────────────────────────────
+// ─── The status line's auto-dismiss (MainActivity.kt:734–747) ────────────────────────────────
 
 namespace {
 
 /**
- * One status field's watcher and deadline, for the 5 s window both status lines run.
+ * One status field's watcher and deadline, for the window both status lines run.
  *
  * The WATCHER half: a CHANGE in the message re-arms the window; a change TO empty cancels it. The
  * field is the funnel, not its call sites — any site that assigns it, including ones not written
@@ -191,6 +264,14 @@ void InputDispatcher::run_due_status_dismiss() {
 }
 
 bool InputDispatcher::recover_from_autosave() {
+    // ⚠️ A recovery opens every source the crashed session had open, so it costs exactly what loading
+    // that project from the browser costs — and it is the load the user is LEAST expecting to wait
+    // for, because they only pressed A on a question. Same strip, same delay, same B.
+    //
+    // ⚠️ The AUTO path reaches this too (`boot_recovery`), which is the one caller with no window
+    // behind it on some platforms; the strip simply never gets a repaint hook there and nothing is drawn.
+    const LoadScope recoverScope(*this, now_ms_, "RECOVERED WORK");
+
     if (!autosave_load(host_, fs_, mediaBaseDir_)) {
         s_.statusMessage = "RECOVER FAILED";
         s_.statusSuccess = false;
@@ -198,6 +279,23 @@ bool InputDispatcher::recover_from_autosave() {
     }
 
     reset_editing_context();
+
+    // ⚠️⚠️ **A CANCELLED RECOVERY MUST RETURN TRUE, WHICH LOOKS BACKWARDS AND IS THE WHOLE POINT.**
+    // `confirm_accept` reads a false as "this file is no good" and DELETES the autosave — so reporting
+    // the cancel honestly here would throw the user's crashed session away because they stopped a slow
+    // load. The document goes blank (half its instruments point at audio the engine does not have) and
+    // the FILE STAYS, so the next launch offers it again.
+    if (pt::load_cancelled()) {
+        host_.new_project();
+        host_.push_params();
+        reset_editing_context();
+        s_.projectVersion      = 0;
+        s_.savedProjectVersion = 0;
+        s_.projectPath.clear();
+        s_.statusMessage = "RECOVER CANCELLED";
+        s_.statusSuccess = true;
+        return true;
+    }
 
     // ⚠️ **DIRTY, on purpose — the one load path in the app that is.** `load_project_done` aligns the
     // two versions because a loaded project IS what is on disk. Recovered work is not: it lives in one
@@ -344,8 +442,9 @@ CursorContext InputDispatcher::cursor_context() const {
         }
         case ScreenType::SCALE: {
             ScaleState cs{p.scales[static_cast<size_t>(s_.currentScale)]};
-            cs.key       = p.scaleKey;
-            cs.cursorRow = s_.scaleCursorRow;
+            cs.key          = p.scaleKey;
+            cs.cursorRow    = s_.scaleCursorRow;
+            cs.cursorColumn = s_.scaleCursorColumn;
             return scale_.cursor_context(cs);
         }
 
@@ -357,6 +456,7 @@ CursorContext InputDispatcher::cursor_context() const {
             is.sfPresetName  = s_.sfPresetName;
             is.sfPresetCount = s_.sfPresetCount;
             is.sfPresetIndex = s_.sfPresetIndex;
+            is.allowOscLoop  = s_.caps.loopWindow;
             return instrument_.cursor_context(is);
         }
 
@@ -481,7 +581,8 @@ bool InputDispatcher::apply_edit(const InputAction& action) {
             // was handed — it edits the project. The module says so by handing the new key back
             // rather than by reaching for a Project it has no business holding.
             const ScaleInputResult r = scale_.handle_input(
-                p.scales[static_cast<size_t>(s_.currentScale)], p.scaleKey, s_.scaleCursorRow, action);
+                p.scales[static_cast<size_t>(s_.currentScale)], p.scaleKey, s_.scaleCursorRow,
+                s_.scaleCursorColumn, action);
             if (r.newKey >= 0) p.scaleKey = r.newKey;
             return r.modified;
         }
@@ -897,6 +998,66 @@ void InputDispatcher::theme_row_action() {
     }
 }
 
+// ─── The SCALE screen's NAME row ─────────────────────────────────────────────────────────────────
+
+void InputDispatcher::scale_row_action() {
+    const songcore::Scale& scale =
+        host_.project().scales[static_cast<size_t>(s_.currentScale)];
+
+    switch (scale_name_action(s_.scaleCursorRow, s_.scaleCursorColumn)) {
+        case ScaleNameAction::SAVE: {
+            // Seeded with the SANITIZED name the row is showing, so what you are shown is what the file
+            // will be called — and the row shows a name even for a slot that stores none, which is why
+            // it is `scale_display_name` and not `scale.name`.
+            const std::string seed = sanitize_scale_filename(songcore::scale_display_name(scale));
+            open_qwerty(QwertyContext::SCALE_SAVE, seed.empty() ? "SCALE" : seed, "SAVE SCALE:",
+                        fs_.scales_directory(), /*max_length=*/20, /*clear_on_first_b=*/true);
+            break;
+        }
+        case ScaleNameAction::LOAD:
+            // ⚠️ Unlike the theme's, nothing has to be closed first: SCALE is a SCREEN, so the browser
+            // simply replaces it and `previousScreen` brings the user back. The theme editor is an
+            // overlay and would have been left standing underneath.
+            //
+            // ⚠️ And unlike every other load, this browser starts at the built-in folder rather than at
+            // a config.json override — `folders` names five categories and scales is not one of them.
+            // Adding a sixth key means changing the template every user has already been seeded with,
+            // which is a decision about config.json rather than about scales.
+            open_file_browser(AppState::BrowserPurpose::LOAD_SCALE, fs_.scales_directory(),
+                              {SCALE_FILE_EXT});
+            break;
+        case ScaleNameAction::NONE:
+            break;
+    }
+}
+
+void InputDispatcher::save_scale_as(const std::string& dir, const std::string& typed_text) {
+    // The theme save's two-names rule, on a scale: the FILENAME is sanitized so it survives a FAT32
+    // card, the name IN the file is what was typed. An empty field keeps the name the row was showing
+    // rather than blanking it, and falls back to "SCALE" for the file — never `.pts`, which is a
+    // dotfile the browser does not list.
+    const std::string safe = sanitize_scale_filename(typed_text);
+    const std::string file = (safe.empty() ? std::string("SCALE") : safe) + ".pts";
+
+    songcore::Scale& slot = host_.edit_project().scales[static_cast<size_t>(s_.currentScale)];
+
+    // ⚠️ THE SLOT ADOPTS THE NAME IT WAS SAVED UNDER, where the THEME row deliberately does not. That
+    // divergence is on purpose: the theme's is a Kotlin wart kept for parity, and here the name is the
+    // only thing on screen that says which file this slot is. Adopting it is also what clears the `*` —
+    // the slot now matches the shape it is named after, because that shape is the one just written.
+    const std::string want = !typed_text.empty()          ? typed_text
+                           : !slot.name.empty()           ? slot.name
+                                                          : songcore::scale_display_name(slot);
+    if (slot.name != want) {
+        slot.name = want;
+        mark_modified();
+    }
+
+    const bool ok = save_scale_file(fs_, dir + "/" + file, slot);
+    s_.statusMessage = ok ? "SCALE SAVED" : "SAVE FAILED";
+    s_.statusSuccess = ok;
+}
+
 void InputDispatcher::save_theme_as(const std::string& dir, const std::string& typed_text) {
     // ⚠️ TWO DIFFERENT NAMES COME OUT OF ONE TYPED STRING, and mixing them up is the whole trap here:
     //
@@ -948,7 +1109,7 @@ bool InputDispatcher::on_fx_type_column() const {
     }
 }
 
-int InputDispatcher::current_fx_type_index() const {
+int InputDispatcher::current_fx_type_code() const {
     const Project& p = *s_.project;
     int            code = 0;
 
@@ -971,11 +1132,19 @@ int InputDispatcher::current_fx_type_index() const {
             default: break;
         }
     }
-    return songcore::effect_type_index(code);
+    return code;
 }
 
+// The one place the FX list's length is decided — the picker's group lists and the FX column's own step
+// both read it, and a build where those two disagreed would have a cell the picker cannot name.
+//
+// ⚠️ TWO TRIMS OFF ONE TAIL, SO THEY NEST RATHER THAN COMBINE: `LPO` is the entry directly below the
+// MIDI six, so it can only be dropped once they are (songcore/effects.h). Written as a ladder for
+// that reason — a build showing MIDI shows LPO whatever `loopWindow` says.
 int InputDispatcher::visible_effect_type_count() const {
-    return s_.caps.midi ? songcore::EFFECT_TYPE_COUNT : songcore::EFFECT_TYPE_COUNT_NO_MIDI;
+    if (s_.caps.midi)       return songcore::EFFECT_TYPE_COUNT;
+    if (s_.caps.loopWindow) return songcore::EFFECT_TYPE_COUNT_NO_MIDI;
+    return songcore::EFFECT_TYPE_COUNT_STABLE;
 }
 
 void InputDispatcher::apply_fx_type_change(int effect_code) {
@@ -1020,7 +1189,7 @@ void InputDispatcher::apply_fx_type_change(int effect_code) {
 // The one gesture that is not a step at all, the FX picker, stays on the vertical axis.
 
 /**
- * A+LEFT/RIGHT on the INSTRUMENT screen's TYPE cell. Switching a slot's type FREES whatever source it
+ * A+DPAD on the INSTRUMENT screen's TYPE cell. Switching a slot's type FREES whatever source it
  * holds — a sampler has no use for an .sf2 and vice versa — so a loaded slot is asked about through
  * the confirm dialog first, and only an EMPTY slot switches outright.
  *
@@ -1063,7 +1232,25 @@ void InputDispatcher::toggle_instrument_type(int delta) {
     // type instead, so the gesture still has somewhere to go.
     const int from  = (cur >= count) ? count - 1 : cur;
     const auto next = static_cast<songcore::InstrumentType>(((from + step) % count + count) % count);
+
+    // The name the slot would have adopted from the source it is ABOUT to lose — read before the
+    // change, exactly as a source load reads it. See the adopt rule at the end of browser activation:
+    // this is the same question asked at the other end of the same slot's life.
+    const std::string previousAutoName = instrument_auto_name(host_.project(), s_.currentInstrument);
+
     host_.set_instrument_type(s_.currentInstrument, next);
+
+    // ⚠️⚠️ **A TYPE CHANGE DROPS THE SOURCE, SO A NAME TAKEN FROM THAT SOURCE HAS TO GO WITH IT — AND
+    // THE SECOND HALF IS THE ONE THAT BIT.** An orphaned adopted name does not merely mislead: it no
+    // longer matches what the slot's new type would auto-name, so the adopt rule on the NEXT load
+    // reads it as a name the user TYPED and keeps it. The slot then wears the first file's name
+    // through every later load, and the only way out was to blank the name by hand.
+    //
+    // ⚠️ A name the user really did type still survives, here as there — `previousAutoName` is what
+    // tells the two apart, and it is empty for a slot that never had a source. (`ins` is still the
+    // same slot: the type change rewrites it in place and never resizes the pool.)
+    if (!previousAutoName.empty() && ins.name == previousAutoName)
+        ins.name = songcore::default_instrument_name(ins.id);
 
     // The row map just changed under the cursor — the three layouts have 16, 15 and 11 rows — and the
     // cursor is sitting on row 0, which exists in all three. Its COLUMN may not: row 0 caps at 3 on a
@@ -1074,7 +1261,7 @@ void InputDispatcher::toggle_instrument_type(int delta) {
     s_.statusSuccess = true;
 }
 
-/** True when the cursor is on INSTRUMENT's TYPE cell, the one A+LEFT/RIGHT does not merely increment. */
+/** True when the cursor is on INSTRUMENT's TYPE cell, the one A+DPAD does not merely increment. */
 bool InputDispatcher::on_instrument_type_cell() const {
     return s_.currentScreen == ScreenType::INSTRUMENT && s_.instrumentCursorRow == 0 &&
            s_.instrumentCursorColumn == 1;
@@ -1111,15 +1298,16 @@ static int64_t sample_coarse_step(const SampleEditorState& se) {
 //
 //   A+LEFT / A+RIGHT → on the THEME row, step the BUILT-IN palette (prev / next).
 //                      on a colour row, nudge the cursor's channel by ∓0x01.
-//   A+UP   / A+DOWN  → on the THEME row, NOTHING (`if (cursorRow >= 1)` — there is no coarse step for a
-//                      palette, and no fifth thing for a name to do).
+//   A+UP   / A+DOWN  → on the THEME row, step the palette too: a list of presets has no coarse step,
+//                      and a cell that can be changed at all should answer both axes.
 //                      on a colour row, nudge the cursor's channel by ±0x10.
 
 void InputDispatcher::on_a_up() {
     if (overlay_swallows(Overlay::THEME | Overlay::EQ | Overlay::FX_HELPER)) return;
     if (theme_open()) {
-        // Row 0 falls through to nothing: `theme_adjust_color` rejects it, as the coarse arm must.
-        theme_adjust_color(s_.theme, s_.themeEditor.cursorRow, s_.themeEditor.cursorChannel, +0x10);
+        if (s_.themeEditor.cursorRow == 0) theme_cycle_builtin(s_.theme, +1);
+        else theme_adjust_color(s_.theme, s_.themeEditor.cursorRow,
+                                s_.themeEditor.cursorChannel, +0x10);
         return;
     }
     if (eq_open()) { generic_input(pt::ui::increment_fast); return; }
@@ -1127,17 +1315,22 @@ void InputDispatcher::on_a_up() {
     if (on_sample_selection_row()) { nudge_selection_edge(+sample_coarse_step(s_.sampleEditor)); return; }
     if (on_sample_slice_marker_row()) { nudge_slice_marker(+sample_coarse_step(s_.sampleEditor)); return; }
     if (on_fx_type_column()) {
-        s_.fxHelper = fx_helper_opened_at(current_fx_type_index(),
-                                          FxGrid::of(visible_effect_type_count()));
+        s_.fxHelper = fx_helper_opened_at(current_fx_type_code(),
+                                          fx_layout_for(visible_effect_type_count()));
         return;
     }
+    // The TYPE cell is a three-stop cycle with no coarse step, so both axes walk it — and both go
+    // through the same request, which means both still meet the confirm dialog on a loaded slot.
+    if (on_instrument_type_cell()) { request_instrument_type_toggle(+1); return; }
     selection_or_single(pt::ui::increment_fast);
 }
 
 void InputDispatcher::on_a_down() {
     if (overlay_swallows(Overlay::THEME | Overlay::EQ | Overlay::FX_HELPER)) return;
     if (theme_open()) {
-        theme_adjust_color(s_.theme, s_.themeEditor.cursorRow, s_.themeEditor.cursorChannel, -0x10);
+        if (s_.themeEditor.cursorRow == 0) theme_cycle_builtin(s_.theme, -1);
+        else theme_adjust_color(s_.theme, s_.themeEditor.cursorRow,
+                                s_.themeEditor.cursorChannel, -0x10);
         return;
     }
     if (eq_open()) { generic_input(pt::ui::decrement_fast); return; }
@@ -1145,10 +1338,11 @@ void InputDispatcher::on_a_down() {
     if (on_sample_selection_row()) { nudge_selection_edge(-sample_coarse_step(s_.sampleEditor)); return; }
     if (on_sample_slice_marker_row()) { nudge_slice_marker(-sample_coarse_step(s_.sampleEditor)); return; }
     if (on_fx_type_column()) {
-        s_.fxHelper = fx_helper_opened_at(current_fx_type_index(),
-                                          FxGrid::of(visible_effect_type_count()));
+        s_.fxHelper = fx_helper_opened_at(current_fx_type_code(),
+                                          fx_layout_for(visible_effect_type_count()));
         return;
     }
+    if (on_instrument_type_cell()) { request_instrument_type_toggle(-1); return; }
     selection_or_single(pt::ui::decrement_fast);
 }
 
@@ -1312,6 +1506,18 @@ void InputDispatcher::on_a_a() {
     if (s_.currentScreen == ScreenType::SONG && s_.selection.active) {
         open_qwerty(QwertyContext::RESAMPLE, resample_base_name(fs_), "SAMPLE NAME:", "",
                     /*max_length=*/20, /*clear_on_first_b=*/true);
+        return;
+    }
+
+    // ⚠️ TAP TEMPO COUNTS EVERY PRESS, AND ITS FAST HALF ARRIVES HERE RATHER THAN AT `on_button_a`.
+    // The mapper routes a second A inside 300 ms to the double-tap handler, and 300 ms IS 200 BPM —
+    // squarely inside the row's 20..999 range. Without this arm every other tap above 200 BPM would
+    // be swallowed by the insert-position gate below and the tempo would settle at half what was
+    // tapped. Ahead of that gate for the same reason RESAMPLE is: PROJECT never arms an insert.
+    if (s_.currentScreen == ScreenType::PROJECT &&
+        s_.projectCursorRow == static_cast<int>(ProjectRow::TEMPO) &&
+        s_.projectCursorColumn == 2) {
+        tap_tempo();
         return;
     }
 
@@ -2540,11 +2746,60 @@ void InputDispatcher::project_action() {
             else                    s_.shouldQuit = true;
             break;
 
-        // TEMPO / TRANSPOSE are A+DPAD cells. Plain A does nothing on them, as it does nothing on any
+        // TAP — the TEMPO row's second cell, and A on it alone.
+        //
+        // ⚠️⚠️ **THE COLUMN GUARD IS THE FEATURE, NOT A TIDY-UP.** This arm first ran on the whole
+        // row, and it counted every A+UP the user pressed to nudge the BPM: the mapper fires the
+        // plain-A handler on A's OWN PRESS, so a modifier held down to edit a value is also a bare A
+        // as far as this switch can tell. Reported from the device — "even when i just want to edit
+        // bpm by A+DPAD it changes tempo". The tap needs a cell nothing else is aimed at.
+        case ProjectRow::TEMPO:
+            if (s_.projectCursorColumn == 2) tap_tempo();
+            break;
+
+        // TRANSPOSE is an A+DPAD cell. Plain A does nothing on it, as it does nothing on any other
         // value cell in the app.
         default:
             break;
     }
+}
+
+void InputDispatcher::tap_tempo() {
+    const long long now = now_ms_;
+
+    // A gap this long is a pause, not a beat — start counting again from this tap.
+    if (tapTempoLastMs_ == 0 || now - tapTempoLastMs_ > TAP_TEMPO_TIMEOUT_MS) {
+        tapTempoLastMs_ = now;
+        tapTempoCount_  = 0;
+        return;
+    }
+
+    const long long gap = now - tapTempoLastMs_;
+    // A bounce, or two fingers on one press. Keep the anchor where it was so the NEXT tap still
+    // measures from the last real one rather than from the bounce.
+    if (gap < TAP_TEMPO_MIN_MS) return;
+    tapTempoLastMs_ = now;
+
+    // Shift the ring, newest last. Four entries is small enough that moving them beats the arithmetic
+    // of a write cursor, and it keeps the average a plain sum over `tapTempoCount_`.
+    for (int i = TAP_TEMPO_KEEP - 1; i > 0; --i) tapTempoGaps_[i] = tapTempoGaps_[i - 1];
+    tapTempoGaps_[0] = gap;
+    if (tapTempoCount_ < TAP_TEMPO_KEEP) ++tapTempoCount_;
+
+    long long sum = 0;
+    for (int i = 0; i < tapTempoCount_; ++i) sum += tapTempoGaps_[i];
+    const long long meanMs = sum / tapTempoCount_;
+    if (meanMs <= 0) return;
+
+    // Rounded, not truncated: 120 BPM taps in as a mean of 500 ms and must come out as 120, and a
+    // gap one millisecond either side of that must not read as 119.
+    const int bpm = static_cast<int>((60000 + meanMs / 2) / meanMs);
+
+    Project& p = host_.edit_project();
+    const int clamped = std::min(999, std::max(20, bpm));
+    if (p.tempo == clamped) return;   // no edit, so no dirty bump and no lookahead rollback
+    p.tempo = clamped;
+    mark_modified();
 }
 
 void InputDispatcher::settings_action() {
@@ -2839,6 +3094,14 @@ void InputDispatcher::on_button_a() {
     // `open_sub_screen_at_cursor` — Kotlin splits them the same way (`handleConfirmAInstrument`).
     if (instrument_open_at_cursor()) return;
 
+    // A on the SCALE screen's SAVE / LOAD cells. Like the two arms above it this returns rather than
+    // falling through, and unlike them it is a SCREEN rather than an overlay — so it is placed here, in
+    // the run of "A on a button", and not up among the modal guards.
+    if (s_.currentScreen == ScreenType::SCALE) {
+        scale_row_action();
+        return;
+    }
+
     // A on an EMPTY cell inserts the item you last edited. That is what makes A,A meaningful: press
     // A once to lay down the last chain again, press it twice to get a fresh one.
     Project& p = host_.edit_project();
@@ -2909,6 +3172,16 @@ void InputDispatcher::on_button_a() {
             }
             break;
         }
+
+        // A on the end-of-pattern marker lays a step down at the default tick count — the very insert
+        // the cell already declares, reached by the bare press as well as by A+RIGHT. GROOVE has one
+        // editable column and nothing for a plain A to open or confirm, so that is all it can mean.
+        //
+        // ⚠️ Guarded on EMPTY, and that guard is the whole arm: without it a bare A on a tick that is
+        // already there would STEP it, and the press that lays a groove down would also nudge it.
+        case ScreenType::GROOVE:
+            if (cursor_context().capabilities.isEmpty) generic_input(pt::ui::increment);
+            break;
 
         // The two screens whose rows are BUTTONS. Nothing to insert — A *is* the action.
         case ScreenType::PROJECT:  project_action();  break;
@@ -3078,7 +3351,12 @@ void InputDispatcher::on_select() {
     // ⚠️ NOT TO BE CONFUSED WITH THE A-DEFERRAL. `defer_a_to_release` holds A on the cells that open a
     // sub-screen so that a held A+DPAD can still dial the value underneath. That mechanism is required,
     // it is what makes those cells editable at all, and it has nothing to do with this handler.
-    if (overlay_swallows(Overlay::QWERTY)) return;
+    //
+    // ⚠️ THE TWO IN-PLACE OVERLAYS ARE NAMED HERE, and that is what puts help on them: the EQ editor
+    // and the theme editor stand in the module's place and leave the oscilloscope strip drawn, so the
+    // panel has somewhere to go. They are also the two screens whose cell names — EQ FILL, Q, MTR BG —
+    // say least on their own. SELECT does nothing else on either, so nothing is taken back.
+    if (overlay_swallows(Overlay::QWERTY | Overlay::THEME | Overlay::EQ)) return;
 
     // The keyboard's ABORT — the chord alias for the button on its own action row, and the one bare
     // SELECT that duplicates nothing: B backspaces here, so without it the only way to abandon a rename
@@ -3087,19 +3365,27 @@ void InputDispatcher::on_select() {
 
     // ── HELP ─────────────────────────────────────────────────────────────────────────────────────
     //
-    // ⚠️ Gated on there BEING a strip to draw it in. The compact panel takes the oscilloscope's 620×70
-    // and nothing else, and the two full-screen modules have neither — a toggle there would set a flag
-    // no frame reads, and the next screen you walked onto would come up holding help you never asked
-    // for. (`full_screen_module` is in ui/app_state.h, shared with the two questions layout.cpp asks.)
-    if (full_screen_module(s_)) return;
+    // ⚠️ **THE SAMPLE EDITOR REACHES THIS, AND THE FILE BROWSER DOES NOT — but only ONE of those two
+    // is decided here.** The browser is `Overlay::BROWSER`, which this handler does not arm for, so
+    // the modal rule at the top of the function has already returned: it has no 620-wide box to spare
+    // (nineteen file rows and two status bars fill all 640×480) and SELECT is its rename/delete/
+    // new-folder modifier besides. The sample editor is full-screen too but is neither — its WAVEFORM
+    // panel is the same 620 wide at the same left edge as the strip, and it is the one box on any
+    // screen the cursor never lands on, so the panel stands in its place (layout.cpp).
+    //
+    // ⚠️ The editor's "ARE YOU SURE?" is NOT an `Overlay`, so the modal rule did not see it — and
+    // SELECT is the one button `button_mapper.h` does not dismiss help on. This is the only way help
+    // could come up over that dialog, so it is refused here rather than guarded again when drawing.
+    if (on_sample_editor() && s_.sampleEditor.showConfirmClose) return;
+
     s_.helpOpen = !s_.helpOpen;
 }
 
 void InputDispatcher::on_help_dismiss() {
     // ⚠️ **THE PRESS IS NOT CONSUMED — it closes help and then does its normal job**, which is the
-    // whole reason help is not an `Overlay`. It covers the strip and never the editor, so there is
-    // nothing under it to protect from a stray press: closing it and swallowing the press would cost a
-    // button on every gesture and buy nothing.
+    // whole reason help is not an `Overlay`. It stands in a box that holds no cell — the visualizer
+    // strip, or the sample editor's waveform — so there is nothing under it to protect from a stray
+    // press: closing it and swallowing the press would cost a button on every gesture and buy nothing.
     s_.helpOpen = false;
 }
 
@@ -3166,7 +3452,12 @@ void InputDispatcher::on_start() {
         // A file on disk has no song cell behind it — neutral gain, and never the channel an earlier
         // audition left pointed at.
         host_.set_preview_track(-1);
+        // ⚠️ An audition is a full DECODE, so a four-minute mp3 costs here exactly what it costs on a
+        // real load — and this is the one the user presses casually, walking a folder. Same strip, same
+        // B to stop it.
+        const LoadScope previewScope(*this, now_ms_, item->displayName);
         if (!host_.preview_file(item->path)) {
+            if (host_.last_load_cancelled()) return;   // stopped on purpose; nothing failed
             s_.fileBrowser.statusMessage = "PREVIEW FAILED";
             s_.fileBrowser.statusSuccess = false;
         }
@@ -3635,6 +3926,12 @@ void InputDispatcher::browser_confirm() {
     // from. See the adopt rule below; on anything but a source load nobody looks at it.
     const std::string previousAutoName = instrument_auto_name(host_.project(), sourceId);
 
+    // ⚠️ EVERY arm, not only the ones expected to be slow. Which loads are slow is a fact about the
+    // FILE and the DEVICE, not about the menu item — a `.ptt` theme is bytes and a `.sf3` is half a
+    // minute, and both come through here. The scope costs nothing on a fast one: below the delay
+    // nothing is drawn and nothing is dimmed.
+    const LoadScope loadScope(*this, now_ms_, stem);
+
     bool ok = false;
     switch (s_.browserPurpose) {
         case AppState::BrowserPurpose::LOAD_PRESET:
@@ -3672,6 +3969,23 @@ void InputDispatcher::browser_confirm() {
                 b.statusSuccess = false;
                 return;
             }
+            // ⚠️⚠️ **A CANCELLED PROJECT LOAD CANNOT BE LEFT WHERE IT STOPPED, AND THIS IS THE ONE
+            // CANCEL THAT COSTS SOMETHING.** A single file that is stopped leaves the slot it was
+            // going into untouched; a project is a whole document, already swapped in, with the
+            // instruments after the stopping point pointing at audio the engine does not have — they
+            // would look loaded on the screen and play silence. The honest state is the blank
+            // document NEW PROJECT gives, and the message says which of the two happened.
+            if (pt::load_cancelled()) {
+                host_.new_project();
+                host_.push_params();
+                // The same settling `load_project_done` does — an empty path, because there is no
+                // file this document came from, and the autosave cleared because the work that was
+                // in it belonged to the project the user has just left.
+                load_project_done("");
+                s_.statusMessage = "LOAD CANCELLED";
+                s_.statusSuccess = true;
+                return;
+            }
             load_project_done(path);
             return;
 
@@ -3695,9 +4009,38 @@ void InputDispatcher::browser_confirm() {
             s_.statusMessage = "THEME LOADED";
             s_.statusSuccess = true;
             return;
+
+        case AppState::BrowserPurpose::LOAD_SCALE: {
+            // ⚠️ Loaded into a COPY and only committed once it parses, so a truncated or hand-mangled
+            // file cannot leave a slot half-overwritten — and the copy is what keeps the slot's `id`,
+            // which is *which of the sixteen this is* rather than anything the file gets a say in.
+            //
+            // ⚠️ The extension is re-checked even though the browser was opened filtered: the user can
+            // walk out of the Scales folder, and the D-pad does not stop at a directory boundary.
+            songcore::Scale loaded = host_.project().scales[static_cast<size_t>(s_.currentScale)];
+            if (ext != SCALE_FILE_EXT || !load_scale_file(fs_, path, loaded)) {
+                b.statusMessage = "LOAD FAILED";
+                b.statusSuccess = false;
+                return;
+            }
+            host_.edit_project().scales[static_cast<size_t>(s_.currentScale)] = loaded;
+            mark_modified();
+            close_file_browser();
+            s_.statusMessage = "SCALE LOADED";
+            s_.statusSuccess = true;
+            return;
+        }
     }
 
     if (!ok) {
+        // ⚠️ A CANCEL IS NOT A FAILURE AND GETS NO RED LINE. The user pressed B; being told LOAD
+        // FAILED afterwards reads as "and it would not have worked anyway", which is a claim about
+        // the file that nothing here knows. It is asked first for that reason.
+        if (host_.last_load_cancelled()) {
+            b.statusMessage = "CANCELLED";
+            b.statusSuccess = true;
+            return;
+        }
         // ⚠️ "LOAD FAILED" for a file the DEVICE cannot hold sends the user looking for a corrupt
         // file that is fine. The engine separates the two, and that separation is the whole message:
         // the file is sound, this machine cannot hold it, pick a smaller one. No free figure beside
@@ -3974,6 +4317,12 @@ void InputDispatcher::qwerty_apply() {
             // and for the error return Kotlin drops on the floor. ⚠️ `k.contextExtra`, not
             // `s_.qwerty.contextExtra`: the live keyboard was cleared at the top of this function.
             save_theme_as(k.contextExtra, text);
+            break;
+
+        case QwertyContext::SCALE_SAVE:
+            // ⚠️ `k.contextExtra`, for the same reason the arm above it takes one: the live keyboard is
+            // cleared before any of these run, so reading `s_.qwerty` here writes to the filesystem root.
+            save_scale_as(k.contextExtra, text);
             break;
 
         case QwertyContext::SAMPLE_NAME: {

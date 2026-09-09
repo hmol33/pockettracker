@@ -340,6 +340,7 @@ class SongcoreHost {
         if (engine_) {
             engine_->clearScheduledNotes();   // the lookahead: notes, kills AND param updates
             engine_->stopAll();               // …and the voices already sounding (instant — no fade)
+            engine_->stopMetronome();         // …and the click, which is not queued and not a voice
         }
         consumer_.clear_track_mask();   // Kotlin clears phraseTrackMask in clearScheduledNotes/stopAll
         flush_trace();
@@ -364,6 +365,9 @@ class SongcoreHost {
         // must be released even when nothing is playing, because a LEN gate and a panic's note-offs are
         // things we OWE after the last note was scheduled. `pump` is idempotent on an empty queue.
         if (!midiPumpExternal_) external_.pump(seq_.clock());
+        // TEMPO is editable while playing, so the beat length is pushed rather than remembered —
+        // exactly as it is handed to `MidiClock::pump` on every call, and for the same reason.
+        if (engine_) engine_->setMetronomeBeat(frames_per_quarter());
         flush_trace();
     }
 
@@ -605,24 +609,52 @@ class SongcoreHost {
         push_instrument(id);
     }
 
-    // The SF2 preset list, for the INSTRUMENT screen's PRESET row. All three answer for an instrument
-    // with no SoundFont (0 / 0 / "---"), which is what lets the screen draw before anything is loaded.
+    // The SoundFont preset list, for the INSTRUMENT screen's PRESET row. All three answer for an
+    // instrument with no SoundFont (0 / 0 / "---"), which is what lets the screen draw before anything
+    // is loaded — and they read the FILE's index, so they also answer for a bank too large to load.
     int sf_preset_count(int id) const {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return 0;
-        return soundfont_preset_count(*engine_, project_.instruments[static_cast<size_t>(id)], routing_);
+        return soundfont_preset_count(*engine_, project_.instruments[static_cast<size_t>(id)]);
     }
     int sf_preset_index(int id) const {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return 0;
-        return soundfont_preset_index(*engine_, project_.instruments[static_cast<size_t>(id)], routing_);
+        return soundfont_preset_index(*engine_, project_.instruments[static_cast<size_t>(id)]);
     }
     std::string sf_preset_name(int id) const {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return "---";
-        return soundfont_preset_name(*engine_, project_.instruments[static_cast<size_t>(id)], routing_);
+        return soundfont_preset_name(*engine_, project_.instruments[static_cast<size_t>(id)]);
     }
     void set_sf_preset_by_index(int id, int index) {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return;
         songcore::set_soundfont_preset_by_index(*engine_, project_.instruments[static_cast<size_t>(id)],
-                                                routing_, index);
+                                                index);
+    }
+
+    /**
+     * Bring instrument `id`'s loaded sound into line with the preset it names — a load when the PATCH
+     * row has moved, and nothing at all otherwise. Safe to call every frame; see
+     * `sync_instrument_soundfont`.
+     */
+    void sync_sf_preset(int id) {
+        if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return;
+        songcore::sync_instrument_soundfont(*engine_, project_.instruments[static_cast<size_t>(id)],
+                                            routing_);
+    }
+
+    /**
+     * The PATCH row's load, started rather than done. False means the engine was busy and the caller
+     * must ask again — see `request_instrument_soundfont`.
+     */
+    bool request_sf_preset(int id) {
+        if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return true;
+        return songcore::request_instrument_soundfont(
+            *engine_, project_.instruments[static_cast<size_t>(id)], routing_);
+    }
+
+    /** Install a finished background preset load. Called once a frame by the feed. */
+    void poll_sf_load() {
+        if (!engine_) return;
+        songcore::collect_instrument_soundfont(*engine_, project_, routing_);
     }
 
     // ── ↕ the FILE verbs (Phase 3 S6a — what the browser's A button reaches) ─────────────────────
@@ -774,6 +806,17 @@ class SongcoreHost {
      */
     bool last_load_ran_out_of_memory() const {
         return engine_ && engine_->lastLoadFailure() == AudioEngine::LoadFailure::OUT_OF_MEMORY;
+    }
+
+    /**
+     * True when the last media load stopped because the USER stopped it.
+     *
+     * ⚠️ It is a third answer and not a shade of the second: a cancel is not a failure, and the file
+     * is not at fault. The UI's job on this one is to say nothing — the user pressed B and already
+     * knows why nothing arrived. Same one-bool seam as the query above, for the same reason.
+     */
+    bool last_load_cancelled() const {
+        return engine_ && engine_->lastLoadFailure() == AudioEngine::LoadFailure::CANCELLED;
     }
 
     /**
@@ -1256,8 +1299,47 @@ class SongcoreHost {
     }
 
     int64_t after_play() {
+        resync_soundfont_slots();
         flush_trace();
+        // Every play verb goes through here, which is what makes this the one place the metronome's
+        // grid can be pinned — the take's own start frame, so beat 0 is the downbeat by construction.
+        if (engine_) engine_->startMetronome(seq_.playback_start_frame(), frames_per_quarter());
         return seq_.playback_start_frame();
+    }
+
+    /**
+     * Frames in one quarter note at the LIVE tempo — four phrase steps (16ths).
+     *
+     * ⚠️ The same expression `ExternalConsumer::frames_per_quarter` uses, and for the same reason:
+     * multiplying the already-truncated `frames_per_step` keeps the beat on the rounded grid the
+     * scheduler puts notes on, rather than on a more accurate one they would drift away from.
+     */
+    int64_t frames_per_quarter() const {
+        return frames_per_step(project_.tempo, sampleRate_) * 4;
+    }
+
+    /**
+     * Every SoundFont instrument made to hold the sound it names, once, as the transport starts.
+     *
+     * ⚠️ **A SLOT HOLDS ONE PRESET, SO BROWSING THE PATCH ROW NOW COMPETES WITH THE SONG FOR SLOTS.**
+     * Scrolling loads a preset per step; enough steps and the least-recently-used eviction reclaims a
+     * slot a song instrument was pointing at, and `routing.sfSlot` has no way to know — the symptom is
+     * a track playing the wrong instrument with nothing logged. A note trigger bumps its slot's use
+     * tick, so a song that is PLAYING defends its own slots; this is what covers the case where the
+     * browsing happened while stopped.
+     *
+     * It is here rather than at the four `play_*` entry points because correctness must not rest on
+     * each of them remembering. Nearly always free: a non-SoundFont instrument returns on its type, and
+     * a slot that already holds the right sound returns on a comparison.
+     *
+     * ⚠️ A project naming more distinct SoundFont sounds than there are slots cannot have them all
+     * resident in any arrangement, and this cannot fix that — it will reload the stale ones on every
+     * start. `MAX_SOUNDFONTS` is sized so that eight tracks plus the preview lane fit.
+     */
+    void resync_soundfont_slots() {
+        if (!engine_) return;
+        for (const Instrument& ins : project_.instruments)
+            songcore::sync_instrument_soundfont(*engine_, ins, routing_);
     }
 
     /**

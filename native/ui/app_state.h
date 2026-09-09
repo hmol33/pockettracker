@@ -87,6 +87,10 @@ struct AppState {
     int tableCursorColumn = 1;  // starts on transpose
     int grooveCursorRow   = 0;
     int scaleCursorRow    = 0;
+    // ⚠️ Read on the SCALE screen's NAME row and nowhere else — that is the only row there with more
+    // than one cell. It is NOT what `InputDispatcher::cursor_column()` answers for SCALE: that one
+    // feeds the selection and the clipboard, which see this screen as a single column of degrees.
+    int scaleCursorColumn = 0;
 
     // INSTRUMENT. Its rows are not a uniform grid — they are the row-kind table in
     // ui/instrument_row_layout.h, and the cursor walks that rather than a range.
@@ -280,7 +284,8 @@ struct AppState {
         LOAD_PRESET,        // a .pti into the current instrument slot
         LOAD_SAMPLE_EDITOR, // a .wav into the slot the SAMPLE EDITOR is open on — and back to the editor
         LOAD_PROJECT,       // a .ptp — the whole document, from PROJECT's LOAD button (S7)
-        LOAD_THEME          // a .ptt — and back into the THEME EDITOR, which raised the browser (S9)
+        LOAD_THEME,         // a .ptt — and back into the THEME EDITOR, which raised the browser (S9)
+        LOAD_SCALE          // a .pts into the slot the SCALE screen is showing
     };
     BrowserPurpose browserPurpose = BrowserPurpose::LOAD_SOURCE;
 
@@ -375,6 +380,40 @@ struct AppState {
     // state, so the "is a modal up?" question every handler must ask has exactly one answer to check.
     // See ui/modules/confirm_dialog.h for why that is worth a file.
     ConfirmDialogState confirm{};
+
+    // ── LOADING ──────────────────────────────────────────────────────────────────────────────────
+    //
+    // Opening a file is the one thing the app does that can outlast a frame, and while it does the
+    // frame loop is inside it rather than running. A one-line strip across the top of the screen is
+    // what says so — never a modal: it dims nothing and covers nothing (ui/modules/loading_strip.h).
+    //
+    // ⚠️⚠️ **`shown` IS NOT `running`, AND THE GAP BETWEEN THEM IS THE WHOLE FEATURE.** Almost every
+    // load is over in well under a tenth of a second — a 106 MB `.sf2` takes 0.26 s, every `.wav` is
+    // a read — and a strip that flashes up and away on each of those is worse than none at all. So a
+    // load RUNS from its first moment and is only SHOWN once it has already outstayed
+    // `LOADING_DELAY_MS`. Nothing predicts a file's size or guesses a threshold: the app finds
+    // out the way the user does, by waiting. ⭐ Which also makes it right on a slow device without a
+    // second number — the same file that is instant on a desktop crosses the delay on a handheld,
+    // and the strip appears there and only there.
+    struct LoadingState {
+        /** A load is in flight. Owns every button (Overlay::LOADING) from the first moment. */
+        bool running = false;
+        /** …and has outlasted the delay, so there is a strip on the screen. */
+        bool shown = false;
+        /** 0..1, or **< 0** when nothing in the file states a total — see load_progress.h. */
+        float progress = -1.0f;
+        /** What is being loaded: the file's name, or the project's. Empty draws the title alone. */
+        std::string detail{};
+        /**
+         * Milliseconds since the load opened. It is what raises `shown`, and it is also the ONLY
+         * clock the strip has: with no percentage to draw there has to be something on screen that
+         * moves, or a working load and a hung one look identical.
+         */
+        int elapsedMs = 0;
+        /** B has been pressed. The engine reads it through the tick's return and unwinds. */
+        bool cancelRequested = false;
+    };
+    LoadingState loading{};
 
     // ── The EQ EDITOR (S8) ───────────────────────────────────────────────────────────────────────
     //
@@ -553,6 +592,8 @@ struct AppState {
  * call site remembering — the modal-predicate rule.
  */
 inline bool modal_backdrop_active(const AppState& s) {
+    // ⚠️ A LOAD IS NOT HERE. It draws a status strip across the top and dims nothing — opening a file
+    // asks the user no question, and a screen that goes dark for one reads as far more than it is.
     return s.qwerty.isOpen || s.confirm.is_open() || s.fxHelper.isOpen;
 }
 

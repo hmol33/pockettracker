@@ -5,6 +5,7 @@
 #include <cstdio>
 
 #include "ui/helpers.h"
+#include "ui/modules/confirm_dialog.h"
 
 namespace pt::ui {
 
@@ -466,7 +467,14 @@ void SampleEditorModule::draw(Canvas& c, int x, int y, const SampleEditorState& 
 void SampleEditorModule::draw_waveform(Canvas& c, int x, int y, const SampleEditorState& s,
                                        const Theme& t) const {
     const int wfLeft  = x + 10;
-    const int wfRight = x + 630;
+    const int wfRight = wfLeft + WAVEFORM_W;
+    /**
+     * The last column INSIDE the panel. ⚠️ `wfRight` is the right EDGE, one past it: a mark at the
+     * very end of the view lands there, in the frame margin, where nothing else paints — and the
+     * default selection puts E exactly there, so it is not a corner case. Every mark below tests the
+     * EDGE, so an end-of-view mark still shows, and draws at `wfLast`, so it shows inside.
+     */
+    const int wfLast  = wfRight - 1;
     const int midY    = y + WAVEFORM_H / 2;
 
     c.fill_rect(wfLeft, y, WAVEFORM_W, WAVEFORM_H, t.vizBackground);
@@ -515,12 +523,12 @@ void SampleEditorModule::draw_waveform(Canvas& c, int x, int y, const SampleEdit
         // Test the UNCLAMPED position, draw the clamped one: an edge scrolled out of the window must
         // vanish, not pile up against the panel's border pretending to be there.
         if (sXf >= static_cast<float>(wfLeft) && sXf <= static_cast<float>(wfRight)) {
-            const int sX = std::clamp(static_cast<int>(sXf), wfLeft, wfRight);
+            const int sX = std::clamp(static_cast<int>(sXf), wfLeft, wfLast);
             v_line(c, sX, y, WAVEFORM_H, t.textTitle);
             c.draw_text("S", sX + 2, y + 3, t.textTitle, CHAR_SPACING, FONT_SCALE);
         }
         if (eXf >= static_cast<float>(wfLeft) && eXf <= static_cast<float>(wfRight)) {
-            const int eX = std::clamp(static_cast<int>(eXf), wfLeft, wfRight);
+            const int eX = std::clamp(static_cast<int>(eXf), wfLeft, wfLast);
             v_line(c, eX, y, WAVEFORM_H, t.textTitle);
             c.draw_text("E", eX - 17, y + 3, t.textTitle, CHAR_SPACING, FONT_SCALE);
         }
@@ -544,7 +552,8 @@ void SampleEditorModule::draw_waveform(Canvas& c, int x, int y, const SampleEdit
     auto boundary = [&](int64_t frame, bool active) {
         const float mXf = frame_x(static_cast<float>(frame));
         if (mXf < static_cast<float>(wfLeft) || mXf > static_cast<float>(wfRight)) return;
-        v_line(c, static_cast<int>(mXf), y, WAVEFORM_H, active ? t.textEmpty : t.textParam);
+        v_line(c, std::min(static_cast<int>(mXf), wfLast), y, WAVEFORM_H,
+               active ? t.textEmpty : t.textParam);
     };
 
     // ── The slice boundaries ─────────────────────────────────────────────────────────────────────
@@ -587,20 +596,21 @@ void SampleEditorModule::draw_waveform(Canvas& c, int x, int y, const SampleEdit
         const float playFrame = s.playbackPosition * static_cast<float>(s.totalFrames);
         const float mXf       = frame_x(playFrame);
         if (mXf >= static_cast<float>(wfLeft) && mXf <= static_cast<float>(wfRight))
-            v_line(c, static_cast<int>(mXf), y, WAVEFORM_H, t.vizWave, /*thickness=*/2);
+            v_line(c, std::min(static_cast<int>(mXf), wfLast - 1), y, WAVEFORM_H, t.vizWave,
+                   /*thickness=*/2);
     }
 }
 
 void SampleEditorModule::draw_confirm_dialog(Canvas& c, int x, int y, const Theme& t) const {
     // It covers the editor completely — an unsaved sample is not something to decide about while the
-    // waveform is still inviting you to keep editing it.
+    // waveform is still inviting you to keep editing it. ⚠️ THAT COVER IS WHY THIS DIALOG IS NOT IN
+    // `modal_backdrop_active`: it does not dim the screen, so the shell must not dim the bars either.
     c.fill_rect(x, y, WIDTH, HEIGHT, t.background);
 
-    const int dX = x + 160, dY = y + 200, dW = 320, dH = 80;
-    c.fill_rect(dX, dY, dW, dH, t.meterBackground);
-    c.fill_rect(dX, dY, dW, 2, t.textEmpty);   // the 2px rule along its top edge
-    c.draw_text("ARE YOU SURE?", dX + 55, dY + 15, t.textValue,  CHAR_SPACING, FONT_SCALE);
-    c.draw_text("A=YES  B=NO",   dX + 65, dY + 45, t.textCursor, CHAR_SPACING, FONT_SCALE);
+    // THE app's confirm box, asking this screen's question. It used to be a box of its own — 320×80,
+    // a rule along its top edge instead of an outline — and two boxes asking the same question in two
+    // looks is exactly the drift a shared one cannot have.
+    draw_confirm_box(c, "ARE YOU SURE?", t);
 }
 
 // ─── The cursor ──────────────────────────────────────────────────────────────────────────────────

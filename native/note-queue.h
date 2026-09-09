@@ -13,13 +13,22 @@
 // Forward declaration — tsf is defined in soundfont-voice.cpp (TSF_IMPLEMENTATION).
 struct tsf;
 
-static const int MAX_SOUNDFONTS = 4;
+// A slot holds ONE PRESET, not a whole bank, so eight tracks on eight different sounds of the same
+// file want eight slots — plus the preview lane, plus room for the file the user is scrolling through
+// on the INSTRUMENT screen. A trimmed preset is one to three megabytes, so the headroom is cheap.
+// ⚠️ `SfBigBlock g_sfBig[MAX_SOUNDFONTS + 2]` in soundfont-voice.cpp sizes off this.
+static const int MAX_SOUNDFONTS = 12;
 
 struct SoundfontEntry {
     tsf* handle = nullptr;
     std::mutex mutex;            // Protects handle from concurrent audio/JNI access
     int instrumentId = -1;       // Which Instrument slot owns this (-1 = free)
+    // ⚠️ **The IDENTITY of a slot is the path AND the bank AND the preset**, because what is loaded
+    // is one preset trimmed out of the file rather than the file. Two instruments on the same .sf2 at
+    // different sounds are two slots; matching on the path alone would hand the second one whichever
+    // sound loaded first, with nothing to hear but the wrong instrument.
     std::string filePath;
+    int bank = -1, preset = -1;
     std::atomic<uint64_t> lastUsed{0};  // Monotonic use tick for LRU eviction; 0 = never used
     // Rendered via the master tsf handle on per-track MIDI channels (no per-track clones).
 };
@@ -243,6 +252,23 @@ enum ParamUpdateAction {
     // `eqBands`, because an AUS/AUF morph sets the EQ to a setting no preset holds.
     PARAM_UPDATE_EQ_BANDS,        // active voice: apply eqBands to chain.eq        [EQN + AUS/AUF]
     PARAM_UPDATE_MASTER_EQ_BANDS, // global: apply eqBands to the master EQ         [EQM + AUS/AUF]
+    // ⚠️ THE ONE ACTION THAT SWITCHES A FILTER ON, where the two above it deliberately cannot. It
+    // carries the TYPE in `value2` and the cutoff in `value` so both land in one record on one frame:
+    // two records is two blocks, and a filter that opens before it changes shape clicks. Appended,
+    // like everything else here — an action's number is its identity.
+    PARAM_UPDATE_FILTER_MODE,     // active voice: filter type = value2, cutoff = value*255 [LPF/HPF/BPF]
+    // The two dirt boxes. Each writes a value the per-block recompute already reads, so neither
+    // needs a second write to make the change audible — and each dies with its note, because a
+    // trigger reseeds both from the instrument. Appended, as ever.
+    PARAM_UPDATE_DRIVE,           // active voice: overdrive = value*255                   [DRV]
+    PARAM_UPDATE_CRUSH,           // active voice: bits = high nibble, downsample = low    [CRU]
+    // Fine tune, the same per-note lifetime and the same "write what the block already reads" shape.
+    // Both voice types fold it into their pitch every block, so it bends a note already sounding.
+    PARAM_UPDATE_FINE_TUNE,       // active voice: fine tune = value*255, 0x80 = in tune    [FIN]
+    // ⚠️ THE ONE ACTION HERE THAT ACCUMULATES. Every other arm above writes "the parameter is now
+    // this"; this one adds a signed STEP to a running count the voice keeps, so two records slide
+    // the window twice and a dropped record loses a movement rather than a value. Appended, as ever.
+    PARAM_UPDATE_LOOP_SLIDE,      // active sampler voice: loop window += value*255 sixteenths [LPO]
 };
 
 // One EQ setting as AUTHORED HEX — the domain the project file and the FX cells are written in, not
@@ -328,7 +354,10 @@ struct InstrumentParams {
     int startPoint;     // 0-255 (normalized position)
     int endPoint;       // 0-255 (normalized position)
     bool reverse;       // Play backwards
-    int loopMode;       // 0=off, 1=forward, 2=ping-pong
+    // ⚠️ 3 (OSCILLATOR) is a FORWARD loop whose SCAN RATE is retuned so one trip round the loop is
+    // one cycle of the played note. So the note's pitch comes from the note and the loop LENGTH
+    // becomes a timbre control — the opposite of mode 1, where a short loop IS the pitch.
+    int loopMode;       // 0=off, 1=forward, 2=ping-pong, 3=oscillator
     int loopStart;      // 0-255 (normalized position)
     int loopEnd;        // 0-255 (normalized position); loop region top. 255 = sample end.
 

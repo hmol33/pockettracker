@@ -107,7 +107,8 @@ TSFDEF int tsf_get_presetindex(const tsf* f, int bank, int preset_number);
 // Returns the number of presets in the loaded SoundFont
 TSFDEF int tsf_get_presetcount(const tsf* f);
 
-// PocketTracker local addition: how many floats tsf_load allocated for the sample data.
+// PocketTracker local addition: how many SAMPLES tsf_load allocated for the sample data. They are
+// 16-bit, so the byte cost is twice this.
 TSFDEF unsigned int tsf_get_fontsamplecount(const tsf* f);
 
 // Returns the name of a preset index >= 0 and < tsf_get_presetcount()
@@ -300,6 +301,19 @@ TSFDEF float tsf_channel_get_tuning(tsf* f, int channel);
 #  define TSF_MEMSET  memset
 #endif
 
+/* PocketTracker local addition — FOURTH local change, re-apply on any tsf update.
+   Progress out of, and a stop into, the SF3 sample decode. Unpacking an .sf3 is the slowest thing
+   this library does — one Vorbis stream per sample header, seconds on a handheld — and it is the one
+   part of a load nothing outside can see or interrupt: tsf_load takes no callback.
+   ⚠️ The stream position is NOT a usable substitute. tsf_load_samples reads the whole `smpl` chunk
+   before tsf_decode_sf3_samples decodes any of it, so the file is 100% read before the expensive part
+   starts. The honest counter is the shdr index, which is why the call is where it is.
+   Returns non-zero to continue, zero to abort; undefined it is the constant 1 and every compiler
+   deletes the branch, so an unhosted build of this file behaves exactly as upstream. */
+#if !defined(TSF_PROGRESS)
+#  define TSF_PROGRESS(i, n) 1
+#endif
+
 #if !defined(TSF_POW) || !defined(TSF_POWF) || !defined(TSF_EXPF) || !defined(TSF_LOG) || !defined(TSF_TAN) || !defined(TSF_LOG10) || !defined(TSF_SQRT)
 #  include <math.h>
 #  if !defined(__cplusplus) && !defined(NAN) && !defined(powf) && !defined(expf) && !defined(sqrtf)
@@ -340,13 +354,26 @@ typedef char tsf_char20[20];
 
 #define TSF_FourCCEquals(value1, value2) (value1[0] == value2[0] && value1[1] == value2[1] && value1[2] == value2[2] && value1[3] == value2[3])
 
+/* PocketTracker local addition (fifth) — samples are stored as 16-bit, and this is what turns one
+   back into the -1..1 float a voice renders. 32767 is the SF2 spec's full-scale divisor. */
+#define TSF_SAMPLE_SCALE (1.0f / 32767.0f)
+
 struct tsf
 {
 	struct tsf_preset* presets;
-	float* fontSamples;
-	/* PocketTracker local addition: the length of fontSamples. Upstream computes it during load and
-	   then discards it, so there is no way to ask a loaded font how much audio it is holding. Needed
-	   by AudioEngine::audio_memory_bytes(). Re-apply on any tsf update. */
+	/* PocketTracker local addition — FIFTH local change, re-apply on any tsf update.
+	   ⚠️ **UPSTREAM HOLDS EVERY SAMPLE AS `float`, WHICH COSTS TWICE WHAT THE FILE DOES.** Both
+	   sources are 16-bit: an uncompressed SF2 stores shorts, and an SF3's Vorbis streams were encoded
+	   from shorts. Widening them on load buys no precision and doubles the resident cost of every
+	   font — the one number a handheld runs out of. Stored as shorts and scaled back on the way into
+	   a voice (see TSF_SAMPLE_SCALE in tsf_voice_render), which costs nothing in the render loop
+	   because the scale folds into the per-block gain.
+	   ⚠️ The scale is 32767, not 32768, because that is the divisor upstream's short->float
+	   conversion used and the SF2 spec's full-scale value. */
+	tsf_s16* fontSamples;
+	/* PocketTracker local addition: the length of fontSamples, in SAMPLES (not bytes). Upstream
+	   computes it during load and then discards it, so there is no way to ask a loaded font how much
+	   audio it is holding. Needed by AudioEngine::audio_memory_bytes(). Re-apply on any tsf update. */
 	unsigned int fontSampleCount;
 	struct tsf_voice* voices;
 	struct tsf_channels* channels;
@@ -882,9 +909,9 @@ static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int font
 }
 
 #ifdef STB_VORBIS_INCLUDE_STB_VORBIS_H
-static int tsf_decode_ogg(const tsf_u8 *pSmpl, const tsf_u8 *pSmplEnd, float** pRes, tsf_u32* pResNum, tsf_u32* pResMax, tsf_u32 resInitial)
+static int tsf_decode_ogg(const tsf_u8 *pSmpl, const tsf_u8 *pSmplEnd, tsf_s16** pRes, tsf_u32* pResNum, tsf_u32* pResMax, tsf_u32 resInitial)
 {
-	float *res = *pRes, *oldres; tsf_u32 resNum = *pResNum; tsf_u32 resMax = *pResMax; stb_vorbis *v;
+	tsf_s16 *res = *pRes, *oldres; tsf_u32 resNum = *pResNum; tsf_u32 resMax = *pResMax; stb_vorbis *v;
 
 	// Use whatever stb_vorbis API that is available (either pull or push)
 	#if !defined(STB_VORBIS_NO_PULLDATA_API) && !defined(STB_VORBIS_NO_FROMMEMORY)
@@ -912,17 +939,23 @@ static int tsf_decode_ogg(const tsf_u8 *pSmpl, const tsf_u8 *pSmplEnd, float** p
 		resNum += n_samples;
 		if (resNum > resMax)
 		{
-			/* PocketTracker local addition: DOUBLE rather than step by a fixed 1 M floats. Upstream
-			   caps the growth increment, which makes the number of reallocs linear in the decoded
-			   size and the bytes copied quadratic. Whether that is paid depends on the allocator:
-			   glibc and bionic serve a multi-megabyte block from mmap and realloc it with mremap, so
-			   the pages are repointed and nothing is copied; the MSVC CRT copies every time. Measured
-			   on a 3000-sample font decoding to 410 MB of float, MSVC went 9.93 s -> 3.20 s and glibc
-			   did not move (3.58 s -> 3.51 s). Doubling costs at most 2x the final buffer in slack,
-			   which the trim-down realloc at the end of tsf_decode_sf3_samples gives straight back. */
-			do { resMax += (resMax ? resMax : resInitial); } while (resNum > resMax);
+			/* PocketTracker local addition: grow GEOMETRICALLY rather than by a fixed 1 M floats.
+			   Upstream caps the growth increment, which makes the number of reallocs linear in the
+			   decoded size and the bytes copied quadratic. Whether that is paid depends on the
+			   allocator: glibc and bionic serve a multi-megabyte block from mmap and realloc it with
+			   mremap, so the pages are repointed and nothing is copied; the MSVC CRT copies every
+			   time. Measured on a 3000-sample font decoding to 410 MB of float, MSVC went 9.93 s ->
+			   3.20 s and glibc did not move (3.58 s -> 3.51 s).
+			   ⚠️ The factor is 1.5x and NOT 2x, and on a handheld that is the difference between a
+			   load and a kill. A realloc holds the old block and the new one at the same time, so the
+			   machine is asked for old+new at the moment of the largest step. Measured on a 43 MB
+			   .sf3 decoding to 789 MB: doubling steps 160/320/640/1280 MB and peaks at 640+1280 =
+			   1.9 GB, of which 491 MB is slack nothing ever writes. At 1.5x the ladder is
+			   160/240/360/540/810 and the peak is 540+810 = 1.35 GB — 30% less, for one extra
+			   realloc. The growth stays geometric, so the quadratic copy cost above does not return. */
+			do { resMax += (resMax ? resMax / 2 : resInitial); } while (resNum > resMax);
 			oldres = res;
-			res = (float*)TSF_REALLOC(res, resMax * sizeof(float));
+			res = (tsf_s16*)TSF_REALLOC(res, resMax * sizeof(tsf_s16));
 			/* PocketTracker local addition — THIRD local change, re-apply on any tsf update.
 			   ⚠️ Upstream frees `oldres` here and returns 0. `oldres` is the CALLER's buffer, and
 			   the caller (tsf_decode_sf3_samples) does `TSF_FREE(res); return 0;` on this exact
@@ -934,22 +967,39 @@ static int tsf_decode_ogg(const tsf_u8 *pSmpl, const tsf_u8 *pSmplEnd, float** p
 			   Leaving the buffer for the caller to free is both correct and the smaller change. */
 			if (!res) { stb_vorbis_close(v); return 0; }
 		}
-		TSF_MEMCPY(res + resNum - n_samples, outputs[0], n_samples * sizeof(float));
+		/* PocketTracker local addition (fifth) — was a memcpy of floats. stb_vorbis decodes to float
+		   and the store is 16-bit, so this is where an Ogg stream is quantised. It is a round trip
+		   rather than a loss: the encoder's own input was 16-bit.
+		   ⚠️ CLAMPED. Vorbis is allowed to overshoot ±1.0 slightly, and an unclamped cast wraps
+		   full-scale to the opposite polarity — a click on the loudest frame of the loudest sample. */
+		{
+			const float* in = outputs[0]; tsf_s16* out = res + resNum - n_samples; int j;
+			for (j = 0; j < n_samples; j++)
+			{
+				float s = in[j] * 32767.0f;
+				s = (s >= 0.0f ? s + 0.5f : s - 0.5f);
+				out[j] = (tsf_s16)(s > 32767.0f ? 32767.0f : (s < -32768.0f ? -32768.0f : s));
+			}
+		}
 	}
 	stb_vorbis_close(v);
 	*pRes = res; *pResNum = resNum; *pResMax = resMax;
 	return 1;
 }
 
-static int tsf_decode_sf3_samples(const void* rawBuffer, float** pFloatBuffer, unsigned int* pSmplCount, struct tsf_hydra *hydra)
+static int tsf_decode_sf3_samples(const void* rawBuffer, tsf_s16** pSampleBuffer, unsigned int* pSmplCount, struct tsf_hydra *hydra)
 {
 	const tsf_u8* smplBuffer = (const tsf_u8*)rawBuffer;
 	tsf_u32 smplLength = *pSmplCount, resNum = 0, resMax = 0, resInitial = (smplLength > 0x100000 ? (smplLength & ~0xFFFFF) : 65536);
-	float *res = TSF_NULL, *oldres;
+	tsf_s16 *res = TSF_NULL, *oldres;
 	int i, shdrLast = hydra->shdrNum - 1, is_sf3 = 0;
 	for (i = 0; i <= shdrLast; i++)
 	{
 		struct tsf_hydra_shdr *shdr = &hydra->shdrs[i];
+		/* PocketTracker local addition (fourth) — see TSF_PROGRESS at the top of this file. The
+		   unwind is the SAME one the decode failure below already uses, deliberately: `res` is the
+		   accumulating buffer and freeing it here is the whole cleanup. */
+		if (!TSF_PROGRESS(i, shdrLast + 1)) { TSF_FREE(res); return 0; }
 		if (shdr->sampleType & 0x30) // compression flags (sometimes Vorbis flag)
 		{
 			const tsf_u8 *pSmpl = smplBuffer + shdr->start, *pSmplEnd = smplBuffer + shdr->end;
@@ -969,7 +1019,7 @@ static int tsf_decode_sf3_samples(const void* rawBuffer, float** pFloatBuffer, u
 		}
 		else // raw PCM sample
 		{
-			float *out; short *in = (short*)smplBuffer + resNum, *inEnd; tsf_u32 oldResNum = resNum;
+			const short *in = (const short*)smplBuffer + resNum, *inEnd; tsf_u32 oldResNum = resNum;
 			if (is_sf3) // Fix up sample indices in shdr
 			{
 				tsf_u32 fix_offset = resNum - shdr->start;
@@ -987,33 +1037,35 @@ static int tsf_decode_sf3_samples(const void* rawBuffer, float** pFloatBuffer, u
 			resNum += (tsf_u32)(inEnd - in);
 			if (resNum > resMax)
 			{
-				/* PocketTracker local addition — same doubling as the ogg branch above, for the same
-				   reason. This arm runs for the uncompressed shdrs INTERLEAVED among compressed ones
-				   in a mixed font, so it shares the one accumulating buffer and the one growth rule. */
-				do { resMax += (resMax ? resMax : resInitial); } while (resNum > resMax);
+				/* PocketTracker local addition — the same 1.5x growth as the ogg branch above, for the
+				   same reasons. This arm runs for the uncompressed shdrs INTERLEAVED among compressed
+				   ones in a mixed font, so it shares the one accumulating buffer and must share the
+				   one growth rule: two different factors on one buffer is a ladder nobody can reason
+				   about. */
+				do { resMax += (resMax ? resMax / 2 : resInitial); } while (resNum > resMax);
 				oldres = res;
-				res = (float*)TSF_REALLOC(res, resMax * sizeof(float));
+				res = (tsf_s16*)TSF_REALLOC(res, resMax * sizeof(tsf_s16));
 				if (!res) { TSF_FREE(oldres); return 0; }
 			}
 
-			// Convert the samples from short to float
-			for (out = res + oldResNum; in < inEnd;)
-				*(out++) = (float)(*(in++) / 32767.0);
+			/* PocketTracker local addition (fifth) — was a short->float conversion loop. The store is
+			   now the file's own format, so an uncompressed sample is copied rather than converted. */
+			TSF_MEMCPY(res + oldResNum, in, (size_t)(inEnd - in) * sizeof(tsf_s16));
 		}
 	}
 
 	// Trim the sample buffer down then return success (unless out of memory)
-	if (!(*pFloatBuffer = (float*)TSF_REALLOC(res, resNum * sizeof(float)))) *pFloatBuffer = res;
+	if (!(*pSampleBuffer = (tsf_s16*)TSF_REALLOC(res, resNum * sizeof(tsf_s16)))) *pSampleBuffer = res;
 	*pSmplCount = resNum;
 	return (res ? 1 : 0);
 }
 #endif
 
-static int tsf_load_samples(void** pRawBuffer, float** pFloatBuffer, unsigned int* pSmplCount, struct tsf_riffchunk *chunkSmpl, struct tsf_stream* stream)
+static int tsf_load_samples(void** pRawBuffer, tsf_s16** pSampleBuffer, unsigned int* pSmplCount, struct tsf_riffchunk *chunkSmpl, struct tsf_stream* stream)
 {
 	#ifdef STB_VORBIS_INCLUDE_STB_VORBIS_H
 	// With OGG Vorbis support we cannot pre-allocate the memory for tsf_decode_sf3_samples
-	tsf_u32 resNum, resMax; float* oldres;
+	tsf_u32 resNum, resMax; tsf_s16* oldres;
 	*pSmplCount = chunkSmpl->size;
 	*pRawBuffer = (void*)TSF_MALLOC(*pSmplCount);
 	if (!*pRawBuffer || !stream->read(stream->data, *pRawBuffer, chunkSmpl->size)) return 0;
@@ -1021,20 +1073,18 @@ static int tsf_load_samples(void** pRawBuffer, float** pFloatBuffer, unsigned in
 
 	// Decode custom .sfo 'smpo' format where all samples are in a single ogg stream
 	resNum = resMax = 0;
-	if (!tsf_decode_ogg((tsf_u8*)*pRawBuffer, (tsf_u8*)*pRawBuffer + chunkSmpl->size, pFloatBuffer, &resNum, &resMax, 65536)) return 0;
-	oldres = *pFloatBuffer;
-	if (!(*pFloatBuffer = (float*)TSF_REALLOC(*pFloatBuffer, resNum * sizeof(float)))) *pFloatBuffer = oldres;
+	if (!tsf_decode_ogg((tsf_u8*)*pRawBuffer, (tsf_u8*)*pRawBuffer + chunkSmpl->size, pSampleBuffer, &resNum, &resMax, 65536)) return 0;
+	oldres = *pSampleBuffer;
+	if (!(*pSampleBuffer = (tsf_s16*)TSF_REALLOC(*pSampleBuffer, resNum * sizeof(tsf_s16)))) *pSampleBuffer = oldres;
 	*pSmplCount = resNum;
-	return (*pFloatBuffer ? 1 : 0);
+	return (*pSampleBuffer ? 1 : 0);
 	#else
-	// Inline convert the samples from short to float
-	float *res, *out; const short *in;
+	/* PocketTracker local addition (fifth) — was a short->float widening in place. The store is the
+	   file's own format now, so the chunk is read straight into it. */
 	(void)pRawBuffer;
-	*pSmplCount = chunkSmpl->size / (unsigned int)sizeof(short);
-	*pFloatBuffer = (float*)TSF_MALLOC(*pSmplCount * sizeof(float));
-	if (!*pFloatBuffer || !stream->read(stream->data, *pFloatBuffer, chunkSmpl->size)) return 0;
-	for (res = *pFloatBuffer, out = res + *pSmplCount, in = (short*)res + *pSmplCount; out != res;)
-		*(--out) = (float)(*(--in) / 32767.0);
+	*pSmplCount = chunkSmpl->size / (unsigned int)sizeof(tsf_s16);
+	*pSampleBuffer = (tsf_s16*)TSF_MALLOC(*pSmplCount * sizeof(tsf_s16));
+	if (!*pSampleBuffer || !stream->read(stream->data, *pSampleBuffer, chunkSmpl->size)) return 0;
 	return 1;
 	#endif
 }
@@ -1257,7 +1307,7 @@ static void tsf_voice_calcpitchratio(struct tsf_voice* v, float pitchShift, floa
 static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, int numSamples)
 {
 	struct tsf_region* region = v->region;
-	float* input = f->fontSamples;
+	const tsf_s16* input = f->fontSamples;   /* PocketTracker local addition (fifth) — 16-bit store */
 	float* outL = outputBuffer;
 	float* outR = (f->outputmode == TSF_STEREO_UNWEAVED ? outL + numSamples : TSF_NULL);
 
@@ -1310,7 +1360,13 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 		if (dynamicGain)
 			noteGain = tsf_decibelsToGain(v->noteGainDB + (v->modlfo.level * tmpModLfoToVolume));
 
-		gainMono = noteGain * v->ampenv.level;
+		/* PocketTracker local addition (fifth) — where a 16-bit sample becomes a float again.
+		   ⚠️ **THE SCALE IS FOLDED INTO THE GAIN, NOT APPLIED TO THE SAMPLE**, so the 16-bit store
+		   costs nothing per output sample: one multiply per BLOCK instead of two per sample. It is
+		   exact because everything between the fetch and this gain — the interpolation and the
+		   lowpass — is linear, so scaling the input and scaling the output are the same operation.
+		   The lowpass therefore runs on values up to 32767, which its double state holds easily. */
+		gainMono = noteGain * v->ampenv.level * TSF_SAMPLE_SCALE;
 
 		// Update EG.
 		tsf_voice_envelope_process(&v->ampenv, blockSamples, tmpSampleRate);
@@ -1402,7 +1458,7 @@ TSFDEF tsf* tsf_load(struct tsf_stream* stream)
 	struct tsf_riffchunk chunkList;
 	struct tsf_hydra hydra;
 	void* rawBuffer = TSF_NULL;
-	float* floatBuffer = TSF_NULL;
+	tsf_s16* sampleBuffer = TSF_NULL;
 	tsf_u32 smplCount = 0;
 
 	if (!tsf_riffchunk_read(TSF_NULL, &chunkHead, stream) || !TSF_FourCCEquals(chunkHead.id, "sfbk"))
@@ -1449,9 +1505,9 @@ TSFDEF tsf* tsf_load(struct tsf_stream* stream)
 						#ifdef STB_VORBIS_INCLUDE_STB_VORBIS_H
 						|| TSF_FourCCEquals(chunk.id, "smpo")
 						#endif
-					) && !rawBuffer && !floatBuffer && chunk.size >= sizeof(short))
+					) && !rawBuffer && !sampleBuffer && chunk.size >= sizeof(short))
 				{
-					if (!tsf_load_samples(&rawBuffer, &floatBuffer, &smplCount, &chunk, stream)) goto out_of_memory;
+					if (!tsf_load_samples(&rawBuffer, &sampleBuffer, &smplCount, &chunk, stream)) goto out_of_memory;
 				}
 				else stream->skip(stream->data, chunk.size);
 			}
@@ -1462,22 +1518,22 @@ TSFDEF tsf* tsf_load(struct tsf_stream* stream)
 	{
 		//if (e) *e = TSF_INVALID_INCOMPLETE;
 	}
-	else if (!rawBuffer && !floatBuffer)
+	else if (!rawBuffer && !sampleBuffer)
 	{
 		//if (e) *e = TSF_INVALID_NOSAMPLEDATA;
 	}
 	else
 	{
 		#ifdef STB_VORBIS_INCLUDE_STB_VORBIS_H
-		if (!floatBuffer && !tsf_decode_sf3_samples(rawBuffer, &floatBuffer, &smplCount, &hydra)) goto out_of_memory;
+		if (!sampleBuffer && !tsf_decode_sf3_samples(rawBuffer, &sampleBuffer, &smplCount, &hydra)) goto out_of_memory;
 		#endif
 		res = (tsf*)TSF_MALLOC(sizeof(tsf));
 		if (res) TSF_MEMSET(res, 0, sizeof(tsf));
 		if (!res || !tsf_load_presets(res, &hydra, smplCount)) goto out_of_memory;
 		res->outSampleRate = 44100.0f;
-		res->fontSamples = floatBuffer;
+		res->fontSamples = sampleBuffer;
 		res->fontSampleCount = smplCount;   /* PocketTracker local addition */
-		floatBuffer = TSF_NULL; // don't free below
+		sampleBuffer = TSF_NULL; // don't free below
 	}
 	if (0)
 	{
@@ -1489,7 +1545,7 @@ TSFDEF tsf* tsf_load(struct tsf_stream* stream)
 	TSF_FREE(hydra.phdrs); TSF_FREE(hydra.pbags); TSF_FREE(hydra.pmods);
 	TSF_FREE(hydra.pgens); TSF_FREE(hydra.insts); TSF_FREE(hydra.ibags);
 	TSF_FREE(hydra.imods); TSF_FREE(hydra.igens); TSF_FREE(hydra.shdrs);
-	TSF_FREE(rawBuffer);   TSF_FREE(floatBuffer);
+	TSF_FREE(rawBuffer);   TSF_FREE(sampleBuffer);
 	return res;
 }
 

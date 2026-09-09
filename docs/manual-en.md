@@ -100,7 +100,7 @@ The folder currently in use is marked `(HOME)`. One whose directory has been del
 
 PocketTracker has no bundled default samples — all instrument slots start empty. Copy your own `.wav` files into a folder you have granted, and load them from the **INSTRUMENT** screen using the file browser. SF2 and SF3 files are loaded the same way.
 
-> A large SoundFont of either kind takes a moment to load, and the screen does not redraw while it does. SF3 stores its samples compressed, so its files are much smaller on disk and it holds less memory once loaded, but it takes longer to open than the SF2 of the same bank.
+> Only the sound you have chosen is loaded, rather than the whole bank around it, so even a very large SoundFont costs about as much memory as the one instrument you are playing. Changing the PATCH row loads the new sound once you stop scrolling. The list of sounds inside a file opens straight away, however large the file is. SF3 stores its samples compressed, so its files are much smaller on disk and take a little longer to open.
 
 ### Project files
 
@@ -282,6 +282,7 @@ Hold **A** and press a direction to edit the value under the cursor:
 - For **note values**, large step = ±12 semitones (one octave).
 - For **hex byte values**, large step = ±0x10.
 - Under a scale, a note's small step is the next note **of that scale** rather than the next semitone — see [section 14](#14-scale-screen). The large step stays a full octave.
+- Where a cell is a short list rather than a number — theme presets, scales, SLICE, SOURCE, an on/off flag, the instrument TYPE — there is no large step, and **A + UP/DOWN walk the list exactly as A + RIGHT/LEFT do**.
 
 ---
 
@@ -549,7 +550,9 @@ Notes are written as pitch + octave: `C-4`, `C#4`, `D-4`, … `G-9`. Range is **
 
 ### FX columns
 
-Each FX slot has two parts: **type** (3-letter code) and **value** (2-digit hex). Use A+LEFT/RIGHT on the type to step through the available effects one at a time, or A+UP/DOWN to open the effect picker and choose from the grid. Effects are listed in §21.
+Each FX slot has two parts: **type** (3-letter code) and **value** (2-digit hex). Use A+LEFT/RIGHT on the type to step through the available effects one at a time, or A+UP/DOWN to open the effect picker. Effects are listed in §22.
+
+The picker groups the commands by what they act on — **SEQUENCE**, **INSTRUMENT** and **GLOBAL** — and keeps one group open at a time. A closed group shows `→` after its name, the open one `↓`. Move past the last row of a group and the next one opens; every group starts with `---`, which clears the slot. Keep holding A while you look — the description above the grid follows the cursor — and release A on the command you want.
 
 > [!WARNING]
 > Some effects (**ARP**, **RPT**, **PBN**, **PVB**, **PVX**) **persist across steps that have no note** — they keep running on empty rows. They are cancelled by: a new note on the same track, any effect in the same FX column, setting the effect to `00`, or **KIL**.
@@ -635,7 +638,7 @@ into the mix before it, so master volume takes the reverb and delay down with ev
 the master to `00` really does end in silence, tails included.
 
 The last two stages can also be written from a phrase: `VTR` replaces the track fader and `VMV` the
-master one for as long as the song is playing (§21).
+master one for as long as the song is playing (§22).
 
 ### Slice playback
 
@@ -688,6 +691,10 @@ own.
 | START | Preview highlighted audio (WAV / MP3 / FLAC / OGG / OPUS / M4A) or video file |
 
 The browser can also manage files — see [section 24](#24-file-management).
+
+A load that takes more than a moment puts a **LOADING** line across the top of the screen with the
+file's name and how far along it is. **B** stops it: nothing is loaded, and the slot keeps what it
+had. Cancelling a *project* load leaves you on an empty project. Quick loads show nothing at all.
 
 Compressed audio (MP3 / FLAC / OGG / Opus / M4A) loads as a sample too — it decodes in place, with no
 WAV written. Video files are instead **converted** to a WAV in the Samples folder. See §23 →
@@ -903,7 +910,7 @@ threes under a volume moving in fours.
 
 ### Fades in a table
 
-`AUS` and `AUF` work on a table row as they do on a phrase step (§21), with **rows** as the span:
+`AUS` and `AUF` work on a table row as they do on a phrase step (§22), with **rows** as the span:
 
 ```
      N    VOL  FX1      FX2      FX3
@@ -911,7 +918,8 @@ threes under a volume moving in fours.
 0A   00   --   ---  00  AUF F0   ---  00   ← arrive at F0 eight rows later
 ```
 
-A table `AUS` can move **VOL**, **CUT**, **RES**, **EQN** and **EQM**; anything else to its left is
+A table `AUS` can move **VOL**, **CUT**, **RES**, **LPF**, **HPF**, **BPF**, **END**, **DRV**, **FIN**,
+**EQN** and **EQM**; anything else to its left is
 passed over. The fade follows the playhead of the column holding the value it is moving — `CUT` in
 FX1 above, so that fade runs at FX1's speed whichever column the `AUS` sits in. **HOP steers it** —
 back to the `AUS` row restarts it, into the middle picks it up there, past the `AUF` ends it. A `TIC`
@@ -985,6 +993,7 @@ Each track uses groove `00` by default. Use the **GRV XX** phrase effect to swit
 | Input | Action |
 |---|---|
 | D-pad UP/DOWN | Move between rows |
+| A | On a `--` row, add a step at 12 ticks |
 | A + LEFT/RIGHT | Edit tick value |
 | A + UP/DOWN | Edit tick value (large step) |
 | A + B | Clear row |
@@ -1002,6 +1011,7 @@ A project holds **16 scales**, numbered `00`–`0F`. Every track starts on scale
 
 ```
 SCALE 00                 LEN: 7
+MAJOR              SAVE  LOAD
 KEY        C
 
        EN
@@ -1021,6 +1031,7 @@ B  B    ON
 
 | Field | Meaning |
 |---|---|
+| Name | The scale this slot was taken from. A+LEFT/RIGHT steps through the 38 built-in scales and loads the one you land on. **SAVE** and **LOAD** write and read scale files — see below. |
 | KEY | The root the scale is built from. It belongs to the project rather than to the individual scale, so changing it re-labels every row and moves all 16 scales to the new key. |
 | LEN | How many notes this scale contains. 7 is a mode, 5 a pentatonic, 12 no constraint at all. |
 | Rows 0–B | The twelve intervals above the key, each `ON` or `--`. The note name beside each row is what that interval sounds like in the current key. |
@@ -1031,6 +1042,17 @@ The `>` marker shows a note that is sounding right now. Play a chromatic run und
 
 > [!NOTE]
 > A marker on a row that is switched off is not a mistake — it means the note you are hearing is not in the scale on screen: that track is on a different scale, or the instrument is sliced, or its TSP is off.
+
+### The built-in scales, and scale files
+
+The name row cycles 38 built-in scales — the modes, the pentatonics, the bebop and diminished scales, and a set of Japanese and Indian ones. Landing on a name loads that scale's twelve notes into the slot.
+
+Switching a note on or off afterwards leaves the name alone and puts a `*` in front of it, so `*MAJOR` is a major scale you have changed.
+
+**SAVE** names the slot and writes it to `PocketTracker/Scales` as a `.pts` file; **LOAD** reads one back into the slot you are looking at. The 38 built-ins are written into that folder the first time the app finds it empty, so they are there to edit, rename and copy between devices. Deleting the ones you do not use is permanent — the app does not put them back, and the name row still offers all 38.
+
+> [!NOTE]
+> Cycling the name replaces all twelve notes. Save a scale you have built before stepping off it.
 
 ### What a scale changes
 
@@ -1054,7 +1076,10 @@ While you are typing, the note cell follows the last `SCA` or `SCG` written **at
 | Input | Action |
 |---|---|
 | D-pad UP/DOWN | Move between rows |
-| A + LEFT/RIGHT | Change KEY / switch a note ON or off |
+| D-pad LEFT/RIGHT | On the name row, move between the name, SAVE and LOAD |
+| A + LEFT/RIGHT | Step through the built-in scales / change KEY / switch a note ON or off |
+| A | On SAVE or LOAD, run it. Nothing on any other cell |
+| A + B | On the name, put the slot back to Chromatic — all twelve notes on |
 | A + UP/DOWN | Nothing — none of these cells has a large step |
 | B + LEFT/RIGHT | Previous / next scale |
 
@@ -1305,6 +1330,7 @@ Navigate here: **R+UP** from SONG or CHAIN.
 |---|---|
 | NAME | Project name. Tap A to edit it on the keyboard overlay; hold A + LEFT/RIGHT cycles the character under the cursor in place. |
 | TEMPO | BPM. |
+| TEMPO — TAP | Press RIGHT from the tempo value to reach **TAP**, then press A in time with the tempo you want and the number follows your taps. The first tap starts the count and each one after it refines the reading, so tap at least twice. Leave it alone for three seconds and the next press starts a fresh count. |
 | TRANSPOSE | Global semitone offset applied to all tracks. |
 
 ### File operations
@@ -1341,6 +1367,7 @@ All value rows are edited with **A + D-pad**. A single **A** press is reserved f
 | SCALING | INT / BILINEAR | Screen scaling algorithm. INT = crisp pixel-perfect integer scaling. BILINEAR = smooth subpixel scaling. |
 | BTN SOUND | ON / OFF (+ VOL) | Play a click sound on button press. The **VOL** sub-column to its right sets click volume (`00`–`FF`). |
 | BTN VIBRO | ON / OFF (+ POW) | Haptic feedback on button press (where supported). The **POW** sub-column to its right sets vibration intensity (`00`–`FF`). |
+| METRONOME | ON / OFF (+ VOL) | A click on every beat — one per four phrase steps — for as long as the song is playing, with an accent on the first beat of each bar. The **VOL** sub-column sets how loud it is (`00`–`FF`). You hear it while you work; it is never written into an exported WAV. |
 | KB INSERT | BEFORE / AFTER | Where the QWERTY keyboard inserts characters in name fields. |
 | CURSOR | REMEMBER / REFRESH | Whether cursor position is preserved when switching between screens. |
 | NAV | POOL / SONG | What B + D-pad walks. **SONG** (the default) walks the arrangement: the cursor is a song cell, and the chain and phrase on screen are the ones that cell holds. **POOL** steps through the 00–FF chain and phrase pools instead, which is what earlier versions did — see §5.4. |
@@ -1780,6 +1807,9 @@ skipping any that are not:
 | `VMV` | the master fader |
 | `CUT` | the filter cutoff |
 | `RES` | the filter resonance |
+| `LPF` `HPF` `BPF` | the cutoff of the filter they switch on |
+| `DRV` | the overdrive amount |
+| `FIN` | the fine tune — end to end is a two-semitone glide |
 | `EQN` | this track's EQ — **between two presets** (see below) |
 | `EQM` | the master EQ — **between two presets** (see below) |
 
@@ -1841,9 +1871,9 @@ Move the **instrument's own filter** on **this note only**: `CUT` sets the cutof
 resonance, both `00`–`FF`, the same two values as the FREQ and RES cells on the INSTRUMENT screen (§9).
 The next note starts from the instrument's values again.
 
-> ⚠️ **The instrument must have a FILTER TYPE.** `CUT` and `RES` move the filter the instrument declares —
-> they do not switch one on. On an instrument whose FILTER is `OFF` they do nothing at all. Set FILTER to
-> `LP`, `HP` or `BP` on the INSTRUMENT screen first, and the FX column takes it from there.
+> ⚠️ **The note must have a filter for these two to move.** `CUT` and `RES` move the filter that is
+> already there — they do not switch one on. Give the instrument a FILTER TYPE on the INSTRUMENT screen,
+> or write `LPF`, `HPF` or `BPF` in an earlier FX slot (next section), and the FX column takes it from there.
 
 Cutoff is exponential across the byte: `00` is 20 Hz, `FF` is 20 kHz, and each `+0x33` is roughly one
 decade. On a low-pass, small numbers are dark and large ones are open.
@@ -1857,6 +1887,102 @@ Both can be **ramped** with `AUS`/`AUF`, which is what a filter sweep is:
 
 Both also work in a **table**, once per tic, so a sweep written once follows every note that instrument
 plays — the shortest way to give a sample a filter envelope without spending a modulation slot.
+
+---
+
+### LPF `XX` · HPF `XX` · BPF `XX` — Switch a Filter On
+
+Give **this note** a low-pass, high-pass or band-pass at cutoff `XX`, whatever the instrument's own
+FILTER setting is. The value is the same `00`–`FF` cutoff `CUT` uses: `00` is 20 Hz, `FF` is 20 kHz.
+
+```
+    00    LPF 40                     ← this note plays through a low-pass at 40
+    04    HPF 90                     ← and this one through a high-pass at 90
+```
+
+The filter lasts for the note, like `CUT` and `RES` — the next note starts from the instrument's own
+setting again. `RES` written beside one of them sets its resonance, and `CUT` after it moves the cutoff
+without changing the type, which is what a sweep over an already-chosen filter needs.
+
+All three can be **ramped** with `AUS`/`AUF`, and all three work in a **table row**, once per tic — one
+row there gives every note that instrument plays a filter.
+
+---
+
+### DRV `XX` — Overdrive
+
+Overdrives **this note**, `00` clean through `FF` heavy — the same control the INSTRUMENT screen's
+DRIVE cell holds, written per note. The next note starts from the instrument's own value again.
+
+Ramps with `AUS`/`AUF`, and works on a table row, so a note can dirty up as it holds.
+
+---
+
+### CRU `XY` — Bit Crush + Downsample
+
+Two effects in one cell, each a single digit `0`–`F`:
+
+- **`X`** — bits crushed away. `0` is clean, `F` leaves about one bit.
+- **`Y`** — how far the sample rate is dropped. `0` is clean, `F` is the coarsest.
+
+```
+    00    CRU 80                     ← crushed bits, full rate
+    04    CRU 08                     ← full bit depth, badly downsampled
+    08    CRU 88                     ← both
+```
+
+The same two controls the INSTRUMENT screen holds, written per note, and gone at the next note. It can
+be used on a table row; it cannot be ramped, because the cell is two separate numbers rather than one
+value to slide.
+
+---
+
+### FIN `XX` — Fine Tune
+
+The cents between the semitones. `80` is in tune, `00` is a semitone flat, `FF` a semitone sharp, and
+each step is about 0.8 cents — so anything `PIT` steps over is reachable, and two voices a few steps
+apart beat against each other.
+
+```
+    00    C-4   FIN 84               ← a few cents sharp
+    04    C-4   FIN 7C               ← and a few flat, for a chorus against it
+```
+
+It **retunes the note that is already playing**, so it can be written on a step of its own to bend a
+held note, and an `AUS`/`AUF` ramp across the whole byte is a two-semitone glide. On the same step as
+a note it tunes that note. Gone at the next note, like `CUT` and `DRV`, and it works on a table row.
+
+---
+
+### TSX `XX` — Transpose Multiplier
+
+How far the chain's `TSP` column and the project's `TRANSPOSE` move this step. `01` is normal, `00`
+leaves the note exactly where it is written, higher values move it further, and `FF` downwards move
+it the opposite way.
+
+| Value | Where a `TSP` of `+3` puts a C-4 |
+|---|---|
+| no cell | D#4 — three up, as always |
+| `00` | C-4 — unmoved |
+| `01` | D#4 |
+| `02` | F#4 — six up |
+| `0C` | C-7 — an octave for every step of `TSP` |
+| `FF` | A-3 — three **down** |
+| `FE` | F#3 — six down |
+
+```
+    00    C-4 01  TSX 00               ← this note never moves
+    04    E-4 01                       ← this one follows the chain as usual
+    08    G-4 01  TSX 02               ← and this one moves twice as far
+```
+
+So one phrase can be reused across chains transposed differently, with the notes you want held still
+and the notes you want moved doing the moving.
+
+It applies to the step it is written on and to a phrase only — a `TSX` on a **table row does
+nothing**, because by the time a table runs its note has already been placed. To keep a whole
+instrument still, set `TSP` to `OFF` on the INSTRUMENT screen instead (§10); that switch wins over any
+`TSX`.
 
 ---
 
@@ -2570,6 +2696,13 @@ Open with **A** on an EQ cell.
 | AUF | Automation Finish | `XX` | Destination value; a later step, may be a later phrase of the same chain |
 | CUT | Filter Cutoff | `XX` | This note's filter cutoff (20 Hz–20 kHz, log). Needs a FILTER TYPE on the instrument |
 | RES | Filter Resonance | `XX` | This note's filter resonance. Needs a FILTER TYPE on the instrument |
+| LPF | Low-Pass On | `XX` | Switches a low-pass on for this note at cutoff `XX` |
+| HPF | High-Pass On | `XX` | Switches a high-pass on for this note at cutoff `XX` |
+| BPF | Band-Pass On | `XX` | Switches a band-pass on for this note at centre `XX` |
+| DRV | Overdrive | `XX` | This note's overdrive, `00` clean to `FF` heavy |
+| CRU | Crush + Downsample | `XY` | `X` = bits crushed, `Y` = rate drop; both `0` = clean |
+| FIN | Fine Tune | `XX` | `80` in tune, a semitone either way; retunes a note already playing |
+| TSX | Transpose Multiplier | `XX` | How far TSP moves this note: `01` normal, `00` not at all, `FF` the other way. Phrase only |
 | SCA | Track Scale | `XY` | Puts this track on scale `Y` in key `X` (`0`=C … `B`=B); resets on stop |
 | SCG | Global Scale | `XY` | The same for all eight tracks |
 

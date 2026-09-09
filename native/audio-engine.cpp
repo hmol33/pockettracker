@@ -9,9 +9,11 @@
 #include "audio-decoders.h"
 #include "byte_source.h"   // pt_fopen — the WAV reader and the soundfont loader open through it
 #include "platform_memory.h"   // load_budget_bytes — refuses a load the device cannot hold
+#include "load_progress.h"     // load_tick / load_cancelled — a slow load reports itself and can be stopped
 #include "table_automation.h"  // AUS/AUF pairing over a table's rows — shared with the table editor
 #include <cstdio>
 #include <cstdint>
+#include <climits>   // INT_MAX — tsf_load_memory takes an int size
 #include <cstring>
 #include <new>
 // MSVC defines neither __SSE2__ nor __x86_64__ — it signals x86/x64 with _M_X64 / _M_IX86 — so the
@@ -101,6 +103,10 @@ void AudioEngine::setDeviceSampleRate(int sr) {
 }
 
 AudioEngine::~AudioEngine() {
+    // ⚠️ FIRST. A background preset load holds a `this` capture, so nothing below may free anything
+    // while it is still running. It is at most one preset's decode.
+    discardSoundfontLoad();
+
     // The platform backend (OboeAudioEngine on Android, SdlAudioEngine on desktop) owns and closes the
     // output stream; the core just frees its buffers. The owner (android-main's / the shell's `main`)
     // destroys the backend first, so no callback can run during this teardown.
@@ -446,7 +452,8 @@ int AudioEngine::loadSampleFromWavFile(int id, const char* path) {
     // Stream the data chunk in whole-frame blocks so a sample is never split across a read.
     const int BLOCK_FRAMES = 16384;
     std::vector<uint8_t> blk((size_t)BLOCK_FRAMES * bytesPerFrame);
-    int frameIdx = 0;
+    int  frameIdx  = 0;
+    bool cancelled = false;
     while (frameIdx < totalFrames) {
         int want = totalFrames - frameIdx;
         if (want > BLOCK_FRAMES) want = BLOCK_FRAMES;
@@ -459,9 +466,24 @@ int AudioEngine::loadSampleFromWavFile(int id, const char* path) {
                 newR[frameIdx + i] = decodeWavSample(p + bytesPerSample, audioFormat, bitsPerSample);
         }
         frameIdx += framesGot;
+        // ⭐ The only load in the app whose fraction is exact from the first block: `totalFrames` is
+        // read out of the header. A WAV is a read rather than a decode, so this is normally over
+        // before anything can be drawn — it matters on a slow card and on a very long file.
+        if (!pt::load_tick((float)frameIdx / (float)totalFrames)) { cancelled = true; break; }
         if (framesGot < want) break;  // short read / truncated file (shouldn't happen — see clamp)
     }
     fclose(f);
+
+    // ⚠️ Nothing is published on a cancel — the slot keeps the sample it had. The two fresh buffers
+    // are ours alone at this point (the swap below is what hands them over), so freeing them here is
+    // the whole cleanup.
+    if (cancelled) {
+        delete[] newL;
+        delete[] newR;
+        lastLoadFailure_ = LoadFailure::CANCELLED;
+        LOGD("loadSampleFromWavFile: cancelled at %d/%d frames: %s", frameIdx, totalFrames, path);
+        return 0;
+    }
 
     // `new float[]` is not zero-initialized; a short read above would leave indeterminate tail
     // samples. dataSize is clamped to the bytes actually present, so this is defensive — but zero
@@ -532,8 +554,14 @@ int AudioEngine::loadSampleFromCompressed(int id, const char* path) {
         else if (std::strcmp(ext, "flac") == 0) ok = ptdec::decodeFlacFile(path, L, R, sr);
         else if (std::strcmp(ext, "ogg")  == 0) {
             // An .ogg holds either Vorbis or Opus. Try Vorbis (stb_vorbis); on a miss, retry as Opus.
+            // ⚠️ A CANCEL IS NOT A MISS. Without that term the retry decodes the whole file a second
+            // time with the box still up and the user's press already spent — the one place in the
+            // app where "it failed, try the other decoder" and "stop" arrive as the same false.
             ok = ptdec::decodeOggFile(path, L, R, sr);
-            if (!ok) { L.clear(); R.clear(); ok = ptdec::decodeOpusFile(path, L, R, sr); }
+            if (!ok && !pt::load_cancelled()) {
+                L.clear(); R.clear();
+                ok = ptdec::decodeOpusFile(path, L, R, sr);
+            }
         }
         else if (std::strcmp(ext, "opus") == 0) ok = ptdec::decodeOpusFile(path, L, R, sr);
         // ISO-BMFF containers holding AAC (minimp4 demux + FAAD2). One decoder covers them all — .m4a and
@@ -551,6 +579,14 @@ int AudioEngine::loadSampleFromCompressed(int id, const char* path) {
     }
 
     if (!ok || L.empty() || sr <= 0) {
+        // ⚠️ A CANCEL comes back as the same false as everything else, and it is asked FIRST because
+        // it is the one answer that is not a failure: nothing is wrong with the file and the user is
+        // not to be told there is.
+        if (pt::load_cancelled()) {
+            lastLoadFailure_ = LoadFailure::CANCELLED;
+            LOGD("loadSampleFromCompressed: cancelled (%s)", path);
+            return 0;
+        }
         // ⚠️ A decoder that ran out of room returns false exactly as a corrupt file does, so the
         // reason comes from whether memory is short RIGHT NOW rather than from the return value.
         // The decoders abandon the decode and free as they unwind, so this reads the state that
@@ -611,12 +647,12 @@ int64_t AudioEngine::audio_memory_bytes() const {
     total += pcm(fxPreviewBackup, fxPreviewBackupRight, fxPreviewBackupLen,    4);
     total += pcm(sampleClipboard, sampleClipboardRight, sampleClipboardLength, 4);
 
-    // A SoundFont's PCM lives inside tsf, which converts every sample to float on load. One handle is
+    // A SoundFont's PCM lives inside tsf, which holds every sample as a 16-bit word. One handle is
     // shared by every track pointed at that slot, so it is counted once per LOADED FONT rather than
     // per instrument — the same 40 MB font on four tracks is 40 MB, not 160.
     for (int slot = 0; slot < MAX_SOUNDFONTS; ++slot) {
         if (soundfonts[slot].handle)
-            total += static_cast<int64_t>(tsf_get_fontsamplecount(soundfonts[slot].handle)) * 4;
+            total += static_cast<int64_t>(tsf_get_fontsamplecount(soundfonts[slot].handle)) * 2;
     }
     return total;
 }
@@ -856,6 +892,78 @@ template <typename V> static inline void voiceSetFilterRes(V& v, int res, float 
     voiceSetFilter(v, (int)v.params.base[PARAM_FILTER_CUT], res, sr);
 }
 
+// LPF / HPF / BPF — the one write that switches a filter ON.
+//
+// ⚠️ **IT DELIBERATELY SKIPS `voiceSetFilter`'s `enabled()` GUARD**, which is the whole difference:
+// that guard is what makes CUT and RES inert on an instrument whose FILTER TYPE is OFF, and turning
+// the filter on is what these three are for. Resonance rides along at whatever the voice currently
+// holds — the instrument's, or the last RES — because one FilterModule call takes all four numbers
+// and passing a fresh 0 here would silently undo a RES written on the step before.
+//
+// Per-note like the other two: a note-on rebuilds the chain from the instrument, so a filter opened
+// from a cell is gone by the next note with nothing to restore.
+template <typename V> static inline void voiceSetFilterMode(V& v, int type, int cut, float sr) {
+    const int res = (int)v.params.base[PARAM_FILTER_RES];
+    filterStore(v, cut, res);
+    int modCut = std::max(0, std::min(255, (int)(cut + v.modDestValues[PARAM_FILTER_CUT])));
+    int modRes = std::max(0, std::min(255, (int)(res + v.modDestValues[PARAM_FILTER_RES])));
+    v.chain.filter.setParams(type, modCut, modRes, v.chain.filter.drive, (int)sr);
+}
+
+// ─── DRV / CRU — two writes onto the per-block recompute's own inputs ────────────────────
+//
+// ⚠️ **THE SAMPLER RE-DERIVES BOTH FROM `params.base` EVERY BLOCK AND THE SF VOICE DOES NOT**,
+// and that is the whole difference between the overloads below — the same split `filterStore` makes,
+// for the same reason. A base write IS the command on a sampler voice; on an SF voice, whose chain is
+// set once at trigger, the module has to be written or the value would never be read at all.
+//
+// Per-note by construction: a note-on reseeds the bus and rebuilds the chain from the instrument, so
+// nothing is restored when the note ends.
+
+// LPO. ⚠️ **IT ADDS, WHERE EVERY OTHER SETTER ON THIS PAGE ASSIGNS** — the byte is a signed STEP in
+// sixteenths of the loop's own length, and the voice keeps the running total. Written on a table row
+// it therefore walks the window a step per tic, which is the shape the technique is actually used in.
+// Sampler-only, silently: a SoundFont voice has no sample position to slide.
+static inline void voiceSlideLoop(Voice& v, int byteValue) {
+    v.loopSlideSixteenths += loopSlideSixteenthsOf(byteValue);
+}
+static inline void voiceSlideLoop(SoundfontVoice&, int) {}
+
+static inline void voiceSetDrive(Voice& v, int drive) {
+    v.params.setBase(PARAM_DRIVE, (float)drive);
+}
+static inline void voiceSetDrive(SoundfontVoice& v, int drive) {
+    v.instrParams.drive = drive;   // this voice's own copy: what a later reset would read back
+    v.chain.drive.setDrive(drive);
+}
+
+// ⚠️ The cell is TWO numbers. The sampler passes 0 for downsample at the chain and quantizes the read
+// address instead — a different effect from the module's, and the reason the base write must carry
+// both halves rather than being handed to `crush.setParams` here.
+static inline void voiceSetCrush(Voice& v, int packed) {
+    v.params.setBase(PARAM_CRUSH,      (float)crushBitsOf(packed));
+    v.params.setBase(PARAM_DOWNSAMPLE, (float)crushDownsampleOf(packed));
+}
+static inline void voiceSetCrush(SoundfontVoice& v, int packed) {
+    v.instrParams.crush      = crushBitsOf(packed);
+    v.instrParams.downsample = crushDownsampleOf(packed);
+    v.chain.crush.setParams(v.instrParams.crush, v.instrParams.downsample);
+}
+
+// ─── FIN — the one command that lands in a bus slot the voices ALREADY reset ─────────────────────
+//
+// ⭐ It needs no field of its own: `PARAM_PITCH`'s BASE has been written to zero by both voice types'
+// trigger paths since the bus existed and read by neither, while the MOD half carries the table
+// transpose, the slides and the vibrato. Putting the fine tune in the base is therefore per-note by
+// construction — a trigger clears it — and it cannot collide with any of those.
+//
+// ⚠️ Both voice types have to READ it, and they read it in different places: the sampler folds it
+// into the playback rate (`getModulatedPlaybackRate`), the SoundFont voice into the pitch wheel
+// (`soundfont-voice.cpp`), which also has to count it as active pitch or it re-centres the wheel.
+template <typename V> static inline void voiceSetFineTune(V& v, int byteValue) {
+    v.params.setBase(PARAM_PITCH, fineTuneSemitonesOf(byteValue));
+}
+
 /** A 0-1 CC value back to the 00-FF byte the author typed. */
 static inline int filterByteOf(float value) {
     return std::max(0, std::min(255, (int)(value * 255.0f + 0.5f)));
@@ -1083,6 +1191,30 @@ void AudioEngine::processTableRow(V& voice, const TableRow& row, int lane, bool 
                 voiceSetFilterRes(voice, fxValue, sampleRate);
                 break;
 
+            // LPF / HPF / BPF on a table row. The reason they belong here as much as in a phrase: a
+            // table follows the INSTRUMENT, so one row gives every note that instrument ever plays a
+            // filter — including the CUT and RES rows above it, which without one are inert.
+            case FX_LPF: voiceSetFilterMode(voice, 1, fxValue, sampleRate); break;
+            case FX_HPF: voiceSetFilterMode(voice, 2, fxValue, sampleRate); break;
+            case FX_BPF: voiceSetFilterMode(voice, 3, fxValue, sampleRate); break;
+
+            // DRV / CRU on a table row — the same per-voice writes the FX column makes, once per
+            // tic. A table is where a dirt that rises while the note holds is actually written,
+            // because it wants a value per tic rather than one per step.
+            case FX_DRV: voiceSetDrive(voice, fxValue);     break;
+            case FX_CRU: voiceSetCrush(voice, fxValue);     break;
+
+            // FIN on a table row — a tuning per tic, which is where a chorus or a drifting detune is
+            // actually written. ⚠️ It shares no state with the table's TRANSPOSE column: that column
+            // drives the MOD half of the same bus slot and this writes the BASE, so the two add.
+            case FX_FIN: voiceSetFineTune(voice, fxValue);  break;
+
+            // LPO on a table row, which is where the slide is most of the point: a row under a HOP
+            // walks the loop window a step per tic for as long as the note holds, and that walk is
+            // the drone, the timestretch and the wavetable scan. ⚠️ It ACCUMULATES — a row that fires
+            // 100 tics has moved the window 100 steps, unlike every other arm here.
+            case FX_LPO: voiceSlideLoop(voice, fxValue);    break;
+
             // EQN / EQM on a table row: the same two writes the FX column's EQN and EQM make, once
             // per tic, reached directly rather than through the param queue because the voice is
             // already in hand — the queue's only job on that path is finding it.
@@ -1212,6 +1344,16 @@ void AudioEngine::applyTableRamps(V& voice, const TableRow* rows,
                 break;
             case FX_CUT: voiceSetFilterCut(voice, value, sampleRate); break;
             case FX_RES: voiceSetFilterRes(voice, value, sampleRate); break;
+            // A ramp over one of these moves the CUTOFF and re-asserts the same type every block, so
+            // a sweep cannot lose the filter it opened with half way through.
+            case FX_LPF: voiceSetFilterMode(voice, 1, value, sampleRate); break;
+            case FX_HPF: voiceSetFilterMode(voice, 2, value, sampleRate); break;
+            case FX_BPF: voiceSetFilterMode(voice, 3, value, sampleRate); break;
+            case FX_DRV: voiceSetDrive(voice, value);     break;
+            // A ramp over FIN is a glide: end to end is two semitones, spread over the AUS window.
+            case FX_FIN: voiceSetFineTune(voice, value);  break;
+            // ⚠️ No FX_CRU arm, and its ARMS row says `rampable = false` — a packed pair of nibbles
+            // is not a quantity to interpolate (songcore/effects.h). The default below drops it.
             default: break;   // the registry admits nothing else the table has an arm for
         }
     }
@@ -1451,6 +1593,63 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
                         }
                     if (upd.trackId >= 0 && upd.trackId < SF_VOICE_COUNT && sfVoices[upd.trackId].isActive)
                         voiceSetFilterRes(sfVoices[upd.trackId], res, sampleRate);
+                    break;
+                }
+                // LPF / HPF / BPF — the type and the cutoff out of ONE record, so the filter opens at
+                // the cutoff it was told rather than a block before it. Unlike the two above this is
+                // NOT inert on a voice whose instrument declares no filter: it declares one.
+                case PARAM_UPDATE_FILTER_MODE: {
+                    int cut  = filterByteOf(upd.value);
+                    int type = (int)upd.value2;
+                    for (int v = 0; v < MAX_VOICES; v++)
+                        if (voices[v].isActive && !voices[v].isFadingOut && voices[v].trackId == upd.trackId) {
+                            voiceSetFilterMode(voices[v], type, cut, sampleRate); break;
+                        }
+                    if (upd.trackId >= 0 && upd.trackId < SF_VOICE_COUNT && sfVoices[upd.trackId].isActive)
+                        voiceSetFilterMode(sfVoices[upd.trackId], type, cut, sampleRate);
+                    break;
+                }
+                // DRV / CRU. One write each onto the input the per-block recompute already
+                // reads, so the change is audible in the block it lands in.
+                case PARAM_UPDATE_DRIVE:
+                case PARAM_UPDATE_CRUSH: {
+                    int byteValue = filterByteOf(upd.value);
+                    for (int v = 0; v < MAX_VOICES; v++)
+                        if (voices[v].isActive && !voices[v].isFadingOut && voices[v].trackId == upd.trackId) {
+                            if (upd.action == PARAM_UPDATE_DRIVE) voiceSetDrive(voices[v], byteValue);
+                            else                                  voiceSetCrush(voices[v], byteValue);
+                            break;
+                        }
+                    if (upd.trackId >= 0 && upd.trackId < SF_VOICE_COUNT && sfVoices[upd.trackId].isActive) {
+                        if (upd.action == PARAM_UPDATE_DRIVE) voiceSetDrive(sfVoices[upd.trackId], byteValue);
+                        else                                  voiceSetCrush(sfVoices[upd.trackId], byteValue);
+                    }
+                    break;
+                }
+                // FIN. Its own arm rather than a fourth branch of the chain above: one setter serves
+                // both voice types here, which is exactly what the three above cannot do.
+                case PARAM_UPDATE_FINE_TUNE: {
+                    int byteValue = filterByteOf(upd.value);
+                    for (int v = 0; v < MAX_VOICES; v++)
+                        if (voices[v].isActive && !voices[v].isFadingOut && voices[v].trackId == upd.trackId) {
+                            voiceSetFineTune(voices[v], byteValue); break;
+                        }
+                    if (upd.trackId >= 0 && upd.trackId < SF_VOICE_COUNT && sfVoices[upd.trackId].isActive)
+                        voiceSetFineTune(sfVoices[upd.trackId], byteValue);
+                    break;
+                }
+                // LPO. ⚠️ IT ADDS — every other arm in this switch assigns. The running total is in
+                // SIXTEENTHS of the loop's own length and the mix loop turns it into samples, which
+                // is what keeps sixteen small steps equal to one big one (sampler-voice.h).
+                //
+                // ⚠️ SAMPLER ONLY, and silently so: a SoundFont voice has no sample position to slide,
+                // the same silence OFF keeps.
+                case PARAM_UPDATE_LOOP_SLIDE: {
+                    int steps = loopSlideSixteenthsOf(filterByteOf(upd.value));
+                    for (int v = 0; v < MAX_VOICES; v++)
+                        if (voices[v].isActive && !voices[v].isFadingOut && voices[v].trackId == upd.trackId) {
+                            voices[v].loopSlideSixteenths += steps; break;
+                        }
                     break;
                 }
                 case PARAM_UPDATE_EQ_SLOT: {              // EQN — per-note EQ preset
@@ -1791,7 +1990,8 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
                     }
 
                     voices[v].trigger(samples[note.sampleId], samplesRight[note.sampleId], sampleLengths[note.sampleId],
-                                      note.trackId, rate, note.volume, note.phraseVolume, note.pan, instrumentParams[note.sampleId],
+                                      note.trackId, rate, note.baseFrequency,
+                                      note.volume, note.phraseVolume, note.pan, instrumentParams[note.sampleId],
                                       sampleRate, note.startPointOverride, note.endPointOverride,
                                       note.tableId, effectiveTicRates, note.noteOctave, note.notePitch, startRows);
                     voices[v].instrId = note.sampleId;
@@ -1943,8 +2143,6 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
         Voice& voice = voices[v];
         if (!voice.isActive || !voice.sampleData) continue;
 
-        float modulatedRate = getModulatedPlaybackRate(voice);
-
         int effDrive      = std::max(0, std::min(255, (int)(voice.params.base[PARAM_DRIVE]      + voice.modDestValues[PARAM_DRIVE])));
         int effCrush      = std::max(0, std::min(15,  (int)(voice.params.base[PARAM_CRUSH]      + voice.modDestValues[PARAM_CRUSH])));
         int effDownsample = std::max(0, std::min(15,  (int)(voice.params.base[PARAM_DOWNSAMPLE] + voice.modDestValues[PARAM_DOWNSAMPLE])));
@@ -1970,7 +2168,65 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
             float rawLoop    = voice.params.base[PARAM_LOOP_START]   + voice.modDestValues[PARAM_LOOP_START];
             voice.actualLoopStart = std::max(voice.actualStart, std::min((int)(rawLoop * sl / 255.0f), voice.actualEnd - 1));
             voice.actualLoopEnd   = std::max(voice.actualLoopStart + 1, std::min((int)((float)voice.loopEndNorm * sl / 255.0f), voice.actualEnd));
+
+            // ── LPO: slide the whole window, BOTH ends by the same amount ───────────────────────
+            //
+            // ⚠️⚠️ **BOTH BOUNDS OR NOTHING.** Moving one changes the loop's LENGTH, and on a looped
+            // note the length is the pitch — which is the exact opposite of what this command is for.
+            // The two lines below are the command.
+            //
+            // ⭐ The offset is derived from the RUNNING TOTAL, never accumulated as samples: on a
+            // loop length that is not a multiple of 16 each step rounds, and sixteen rounded steps
+            // do not add up to one loop. From the total, sixteen steps of `01` land exactly where one
+            // step of `10` lands, on every length.
+            //
+            // ⚠️ The COUNT is clamped, not just the offset. Clamping only the offset would let the
+            // count wind up past the end of the sample, so a step back would have an overshoot to
+            // unwind before the window moved at all. Clamped, the window simply STOPS — LGPT's
+            // behaviour, and a wrap would make a drone jump.
+            //
+            // ⚠️⚠️ **THE PLAYHEAD MOVES WITH THE WINDOW, AND THAT IS THE COMMAND'S WHOLE FEEL.** The
+            // window is not what travels — think of the window as fixed and the SAMPLE as sliding
+            // underneath it. So the playhead keeps its position WITHIN the loop and the material
+            // under it changes, right now, in the block the cell lands in.
+            //
+            // Leave the playhead where it is instead and both directions are wrong in their own way:
+            // forward, it has to run to the end of the old window before it ever enters the new one,
+            // so a whole-loop step is heard a loop late; backward, it is already past the new end, so
+            // it snaps to the loop start at an arbitrary phase and **that snap is an audible click** —
+            // certain on a whole-loop step, about one press in sixteen on a sixteenth.
+            //
+            // ⭐ Held as the offset LAST APPLIED, so the shift is a difference between two values both
+            // derived from the running total. Accumulating it per call would reintroduce the rounding
+            // drift the total exists to avoid, and a count that returns to zero would strand the
+            // playhead where the last slide left it.
+            const int len = voice.actualLoopEnd - voice.actualLoopStart;
+            int       off = 0;
+            if (voice.loopSlideSixteenths != 0 && len > 0) {
+                const int maxSixteenths = (int)(((int64_t)(voice.actualEnd - voice.actualLoopEnd) * 16) / len);
+                const int minSixteenths = (int)(((int64_t)(voice.actualStart - voice.actualLoopStart) * 16) / len);
+                voice.loopSlideSixteenths = std::max(minSixteenths,
+                                                     std::min(voice.loopSlideSixteenths, maxSixteenths));
+                off = (int)(((int64_t)voice.loopSlideSixteenths * len) / 16);
+            }
+            if (off != voice.loopSlideFrames) {
+                // ⚠️ ONLY WHILE THE PLAYHEAD IS INSIDE THE LOOP. Before the first wrap it is still in
+                // the intro (start → loop start), and after a note-off on an ADSR voice it is running
+                // the release tail with the loop abandoned; neither is a position the window owns, and
+                // dragging it would walk a released note backwards into the loop it just left.
+                const int wasStart = voice.actualLoopStart + voice.loopSlideFrames;
+                const int wasEnd   = voice.actualLoopEnd   + voice.loopSlideFrames;
+                if (voice.position >= (double)wasStart && voice.position < (double)wasEnd)
+                    voice.position += (double)(off - voice.loopSlideFrames);
+                voice.loopSlideFrames = off;
+            }
+            voice.actualLoopStart += off;
+            voice.actualLoopEnd   += off;
         }
+
+        // ⚠️ AFTER the loop bounds, not before: oscillator mode's rate is derived from the loop
+        // LENGTH, so reading it above would run a block behind every LPO slide and every loop edit.
+        float modulatedRate = getModulatedPlaybackRate(voice);
 
         // Honour the intra-block trigger offset: a note dispatched at blockStart+f must not
         // sound before frame f (kills/params stay block-quantized — onsets are the audible case).
@@ -2129,7 +2385,7 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
             // Active looping is bounded by LOOP END (region [loopStart, loopEnd]). Once loopReleasing
             // is set (ADSR note-off on a looping voice) the loop is abandoned: every mode runs forward
             // to actualEnd so the [loopEnd, end] tail plays out under the release envelope, then fades.
-            if (voice.loopMode == 2 && !voice.loopReleasing) {
+            if (voice.loopMode == LOOP_MODE_PINGPONG && !voice.loopReleasing) {
                 if (voice.loopingBack) {
                     voice.position -= modulatedRate;
                     if (voice.position <= voice.actualLoopStart) {
@@ -2146,7 +2402,7 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
             } else if (voice.reverse && !voice.loopReleasing) {
                 voice.position -= modulatedRate;
                 if (voice.position <= voice.actualStart) {
-                    if (voice.loopMode == 1) {
+                    if (isForwardLoopMode(voice.loopMode)) {
                         voice.position = (double)voice.actualLoopStart;
                     } else {
                         voice.position = (double)voice.actualStart;
@@ -2156,7 +2412,7 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
                 }
             } else {
                 voice.position += modulatedRate;
-                bool activeForwardLoop = (voice.loopMode == 1 && !voice.loopReleasing);
+                bool activeForwardLoop = (isForwardLoopMode(voice.loopMode) && !voice.loopReleasing);
                 double fwdBoundary = activeForwardLoop ? (double)voice.actualLoopEnd : (double)voice.actualEnd;
                 if (voice.position >= fwdBoundary) {
                     if (activeForwardLoop) {
@@ -2489,6 +2745,11 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
     else
         masterChain.limiter.process(output, numFrames, channelCount);
 
+    // ⚠️ AFTER the master chain, and that placement is the point: a click run through the limiter
+    // would duck the whole mix on every beat, and one run through the master EQ would be coloured by
+    // a setting that has nothing to do with it. It is a monitor sitting on top of the finished block.
+    renderMetronome(output, numFrames, channelCount, sampleRate, blockStartFrame, offlineRender);
+
     // Only when an instrument is being monitored (EQ screen), and never block on the UI read.
     if (monitoredInstrId >= 0) {
         std::unique_lock<std::mutex> lock(spectrumMutex, std::try_to_lock);
@@ -2689,22 +2950,104 @@ void AudioEngine::freeSoundfontSlot(int slot) {
     }
     soundfonts[slot].instrumentId = -1;
     soundfonts[slot].filePath.clear();
+    soundfonts[slot].bank   = -1;
+    soundfonts[slot].preset = -1;
 }
 
-int AudioEngine::loadSoundfont(int instrumentId, const char* path) {
-    if (!path) return -1;
+/**
+ * Turn a file plus a bank/preset into a parsed tsf handle. No slot is touched and no member is
+ * written except `lastLoadFailure_`'s answer, which comes back through `failure` instead — this runs
+ * on the background worker as often as on the calling thread.
+ */
+tsf* AudioEngine::parseSoundfont(const char* path, int bank, int preset, LoadFailure* failure) {
+    *failure = LoadFailure::NONE;
 
-    // De-dup: this exact file already loaded reuses its slot instead of a second copy. Multiple
-    // instruments share one handle — they play on distinct MIDI channels (= tracks) and apply their
-    // ADSR override per-note in fireArmedNote, so per-instrument state stays isolated. Frees stay
-    // reference-guarded (setInstrumentType / clearAllSoundfonts).
-    for (int i = 0; i < MAX_SOUNDFONTS; i++) {
-        if (soundfonts[i].handle != nullptr && soundfonts[i].filePath == path) {
-            soundfonts[i].lastUsed.store(nextSfUseTick(), std::memory_order_relaxed);
-            LOGD("🎹 Reusing soundfont slot %d (de-dup): %s", i, path);
-            return i;
+    // ⭐ **THE PREFERRED PATH: cut the one preset out of the file and parse only that.** The trimmed
+    // font is a complete, ordinary SoundFont holding this preset, the instruments it reaches and their
+    // sample bytes — typically under 1 % of the bank — so tsf runs unmodified over a small buffer and
+    // never sees, allocates or decodes the rest. Reading the index costs a few kilobytes.
+    //
+    // A false answer means "this file cannot be cut apart" (a layout with no per-sample byte ranges,
+    // or a preset that is not in it), never "this file is broken" — so it falls through to the whole-
+    // bank parse below, which is what the app did before and still does correctly.
+    {
+        std::vector<uint8_t> trimmed;
+        sf_memory_guard_reset();
+        if (pt::sf_build_trimmed_font(path, bank, preset, trimmed) &&
+            trimmed.size() <= static_cast<size_t>(INT_MAX)) {
+            tsf* small = tsf_load_memory(trimmed.data(), static_cast<int>(trimmed.size()));
+            if (small) {
+                tsf_set_output(small, TSF_STEREO_INTERLEAVED, getSampleRate(), 0.0f);
+                return small;
+            }
+            // ⚠️ Asked before anything else, for the reason the whole-bank path below states: a cancel
+            // and a parse failure unwind through the identical null, and falling through here would
+            // answer a cancelled load by starting the very load the user just stopped.
+            if (pt::load_cancelled()) {
+                LOGD("🎹 Soundfont load cancelled: %s", path);
+                *failure = LoadFailure::CANCELLED;
+                return nullptr;
+            }
+            // A trimmed font that will not parse is a bug here, not a property of the file — but the
+            // user's sound is worth more than the diagnosis, so fall through and load it whole.
+            LOGE("❌ Trimmed soundfont failed to parse, loading whole bank: %s", path);
         }
     }
+
+    // Parse the SF2 into a single master TSF handle. All tracks share it via MIDI channels — no
+    // per-track clones, which would cost 8× the file size in RAM and stall the audio callback.
+    //
+    // `tsf_load` over a `FILE*` rather than `tsf_load_filename`, so the open goes through pt_fopen
+    // like every other one. It is the same stream tsf builds for itself in `tsf_load_filename` —
+    // sequential reads and forward skips only, so the SF2 still streams and peak RAM is the parsed
+    // soundfont, not the file on top of it.
+    FILE* sf = pt_fopen(path, "rb");
+    if (!sf) {
+        LOGE("❌ Cannot open soundfont: %s", path);
+        *failure = LoadFailure::PARSE;
+        return nullptr;
+    }
+    tsf_stream sfStream = { sf, &sfStreamRead, &sfStreamSkip };
+    // ⭐ The guard that makes a too-large font a MESSAGE instead of a kill. There is no size to check
+    // up front — nothing in an SF3 header states its decoded size — so the allocator itself refuses
+    // when a block would exhaust the machine, and tsf's own null checks unwind to the failure below.
+    // Reset first: the flag is what separates "too big for this device" from "not a soundfont".
+    sf_memory_guard_reset();
+    tsf* loaded = tsf_load(&sfStream);
+    std::fclose(sf);
+    if (!loaded) {
+        // ⚠️ Asked FIRST, and before the guard: a cancel is not a failure and must not be reported as
+        // one. tsf unwinds through the identical null return either way (the abort reuses the decode
+        // failure's own cleanup), so the reason is only knowable out here.
+        if (pt::load_cancelled()) {
+            LOGD("🎹 Soundfont load cancelled: %s", path);
+            *failure = LoadFailure::CANCELLED;
+        } else if (sf_memory_guard_tripped()) {
+            LOGE("❌ Soundfont too large for this device (%lld MB free): %s",
+                 (long long)(pt::available_memory_bytes() >> 20), path);
+            *failure = LoadFailure::OUT_OF_MEMORY;
+        } else {
+            LOGE("❌ Failed to parse soundfont: %s", path);
+            *failure = LoadFailure::PARSE;
+        }
+        return nullptr;
+    }
+    // Configured before publication, for the same reason the trimmed path is: a voice that sees the
+    // handle must see it ready. `tsf_set_output` is not a read the audio thread can be racing,
+    // because nothing else has the pointer yet.
+    tsf_set_output(loaded, TSF_STEREO_INTERLEAVED, getSampleRate(), 0.0f);
+    return loaded;
+}
+
+/**
+ * Give a parsed handle a slot, evicting the least-recently-used one if every slot is taken.
+ *
+ * ⚠️ Slot-table work only, and only on the thread that owns it. The mutex is taken to PUBLISH the
+ * pointer — a store — and never across a parse.
+ */
+int AudioEngine::installSoundfont(tsf* handle, int instrumentId, const char* path, int bank,
+                                  int preset) {
+    if (!handle) return -1;
 
     // Find a free slot; if none, evict the genuinely least-recently-used one (smallest use tick), not
     // the smallest instrumentId — that could evict the SoundFont playing right now.
@@ -2726,56 +3069,158 @@ int AudioEngine::loadSoundfont(int instrumentId, const char* path) {
         LOGD("🎹 Evicted soundfont slot %d to make room for instrumentId %d", slot, instrumentId);
     }
 
-    // Parse the SF2 into a single master TSF handle. All tracks share it via MIDI channels — no
-    // per-track clones, which would cost 8× the file size in RAM and stall the audio callback.
-    //
-    // ⚠️ **THE PARSE HAPPENS OUTSIDE THE SLOT MUTEX, and that is the point of the local.**
-    // `tsf_load` reads and allocates a whole SF2 — tens to hundreds of milliseconds — and the audio
-    // thread takes this same mutex two or three times per active SoundFont voice per block. Holding
-    // it across the parse makes a load and a dropout the same event. The mutex is taken only to
-    // PUBLISH the finished pointer, which is a store.
-    //
-    // `tsf_load` over a `FILE*` rather than `tsf_load_filename`, so the open goes through pt_fopen
-    // like every other one. It is the same stream tsf builds for itself in `tsf_load_filename` —
-    // sequential reads and forward skips only, so the SF2 still streams and peak RAM is the parsed
-    // soundfont, not the file on top of it.
-    FILE* sf = pt_fopen(path, "rb");
-    if (!sf) {
-        LOGE("❌ Cannot open soundfont: %s", path);
-        return -1;
-    }
-    tsf_stream sfStream = { sf, &sfStreamRead, &sfStreamSkip };
-    // ⭐ The guard that makes a too-large font a MESSAGE instead of a kill. There is no size to check
-    // up front — nothing in an SF3 header states its decoded size — so the allocator itself refuses
-    // when a block would exhaust the machine, and tsf's own null checks unwind to the failure below.
-    // Reset first: the flag is what separates "too big for this device" from "not a soundfont".
-    sf_memory_guard_reset();
-    tsf* loaded = tsf_load(&sfStream);
-    std::fclose(sf);
-    if (!loaded) {
-        if (sf_memory_guard_tripped()) {
-            LOGE("❌ Soundfont too large for this device (%lld MB free): %s",
-                 (long long)(pt::available_memory_bytes() >> 20), path);
-            lastLoadFailure_ = LoadFailure::OUT_OF_MEMORY;
-        } else {
-            LOGE("❌ Failed to parse soundfont: %s", path);
-            lastLoadFailure_ = LoadFailure::PARSE;
-        }
-        return -1;
-    }
-    // Configured before publication, for the same reason: a voice that sees the handle must see it
-    // ready. `tsf_set_output` is not a read the audio thread can be racing, because nothing else has
-    // the pointer yet.
-    tsf_set_output(loaded, TSF_STEREO_INTERLEAVED, getSampleRate(), 0.0f);
-
     std::lock_guard<std::mutex> sfLock(soundfonts[slot].mutex);
-    soundfonts[slot].handle = loaded;
+    soundfonts[slot].handle       = handle;
     soundfonts[slot].instrumentId = instrumentId;
-    soundfonts[slot].filePath = path;
-    soundfonts[slot].lastUsed.store(nextSfUseTick(), std::memory_order_relaxed);  // freshly loaded = newest
-    lastLoadFailure_ = LoadFailure::NONE;
-    LOGD("🎹 Loaded soundfont slot %d: %s (instrumentId=%d)", slot, path, instrumentId);
+    soundfonts[slot].filePath     = path;
+    soundfonts[slot].bank         = bank;
+    soundfonts[slot].preset       = preset;
+    soundfonts[slot].lastUsed.store(nextSfUseTick(), std::memory_order_relaxed);
+    LOGD("🎹 Loaded soundfont slot %d: %s [%d:%d]", slot, path, bank, preset);
     return slot;
+}
+
+int AudioEngine::loadSoundfont(int instrumentId, const char* path, int bank, int preset) {
+    if (!path) return -1;
+
+    // ⚠️ Only one tsf parse at a time — see parseSoundfont. A synchronous load takes precedence over
+    // a background one simply by waiting for it, which is at most one preset's worth of decode.
+    waitForSoundfontLoad();
+
+    // De-dup: this exact SOUND already loaded reuses its slot instead of a second copy. Multiple
+    // instruments share one handle — they play on distinct MIDI channels (= tracks) and apply their
+    // ADSR override per-note in fireArmedNote, so per-instrument state stays isolated. Frees stay
+    // reference-guarded (setInstrumentType / clearAllSoundfonts).
+    //
+    // ⚠️ The bank and preset are part of the key, not just the path: a slot holds ONE preset cut out
+    // of the file, so two instruments on the same .sf2 at different sounds must not share one.
+    for (int i = 0; i < MAX_SOUNDFONTS; i++) {
+        if (soundfonts[i].handle != nullptr && soundfonts[i].filePath == path &&
+            soundfonts[i].bank == bank && soundfonts[i].preset == preset) {
+            soundfonts[i].lastUsed.store(nextSfUseTick(), std::memory_order_relaxed);
+            LOGD("🎹 Reusing soundfont slot %d (de-dup): %s [%d:%d]", i, path, bank, preset);
+            return i;
+        }
+    }
+
+    LoadFailure failure = LoadFailure::NONE;
+    tsf* handle = parseSoundfont(path, bank, preset, &failure);
+    if (!handle) { lastLoadFailure_ = failure; return -1; }
+
+    const int slot = installSoundfont(handle, instrumentId, path, bank, preset);
+    lastLoadFailure_ = LoadFailure::NONE;
+    return slot;
+}
+
+// ─── the same load, off the drawing thread ──────────────────────────────────────────────────────
+
+AudioEngine::SfRequest AudioEngine::requestSoundfontLoad(int instrumentId, const char* path, int bank,
+                                                         int preset, int* readySlot) {
+    if (readySlot) *readySlot = -1;
+    if (!path) return SfRequest::BUSY;
+
+    // A finished worker still holding its result blocks the next request. The caller polls, so it
+    // will collect it and come back — refusing is what keeps "one result waiting at a time" true.
+    if (sfLoadBusy.load(std::memory_order_acquire)) return SfRequest::BUSY;
+
+    // The same de-dup the synchronous path does, and for the same reason — but here it also spares a
+    // thread: walking back to a preset another instrument still holds costs nothing at all.
+    for (int i = 0; i < MAX_SOUNDFONTS; i++) {
+        if (soundfonts[i].handle != nullptr && soundfonts[i].filePath == path &&
+            soundfonts[i].bank == bank && soundfonts[i].preset == preset) {
+            soundfonts[i].lastUsed.store(nextSfUseTick(), std::memory_order_relaxed);
+            if (readySlot) *readySlot = i;
+            return SfRequest::READY;
+        }
+    }
+
+    sfLoadInstrument = instrumentId;
+    sfLoadPath       = path;
+    sfLoadBank       = bank;
+    sfLoadPreset     = preset;
+    sfLoadHandle     = nullptr;
+    sfLoadFailure    = LoadFailure::NONE;
+    sfLoadDone.store(false, std::memory_order_relaxed);
+    sfLoadBusy.store(true, std::memory_order_release);
+
+    // ⚠️ The worker reads the request fields and writes the result fields, and `sfLoadDone` is the
+    // fence between the two halves. Nothing else touches them while `sfLoadBusy` is set.
+    sfLoadThread = std::thread([this]() {
+        tsf* handle = parseSoundfont(sfLoadPath.c_str(), sfLoadBank, sfLoadPreset, &sfLoadFailure);
+        sfLoadHandle = handle;
+        sfLoadDone.store(true, std::memory_order_release);
+    });
+    return SfRequest::STARTED;
+}
+
+bool AudioEngine::collectSoundfontLoad(int* instrumentId, int* slot) {
+    if (!sfLoadBusy.load(std::memory_order_acquire)) return false;
+    if (!sfLoadDone.load(std::memory_order_acquire)) return false;
+
+    if (sfLoadThread.joinable()) sfLoadThread.join();
+
+    tsf* handle = sfLoadHandle;
+    sfLoadHandle = nullptr;
+
+    const int landed = handle ? installSoundfont(handle, sfLoadInstrument, sfLoadPath.c_str(),
+                                                 sfLoadBank, sfLoadPreset)
+                              : -1;
+    lastLoadFailure_ = handle ? LoadFailure::NONE : sfLoadFailure;
+    if (instrumentId) *instrumentId = sfLoadInstrument;
+    if (slot) *slot = landed;
+
+    // Released LAST: it is what lets the next request start, and the result must be fully read out
+    // of the members before another one can overwrite them.
+    sfLoadBusy.store(false, std::memory_order_release);
+    return true;
+}
+
+bool AudioEngine::soundfontLoadPending() const {
+    return sfLoadBusy.load(std::memory_order_acquire);
+}
+
+void AudioEngine::waitForSoundfontLoad() {
+    if (!sfLoadBusy.load(std::memory_order_acquire)) return;
+    if (sfLoadThread.joinable()) sfLoadThread.join();
+
+    // ⚠️⚠️ **THE RESULT IS KEPT, NOT THROWN AWAY, AND THAT IS THE WHOLE POINT OF WAITING RATHER THAN
+    // CANCELLING.** Only the PARSE has to be alone; the answer is still the answer. Discarding it here
+    // would lose a load the caller was already told had been accepted, and nothing asks twice — the
+    // PATCH row clears its pending flag the moment a request is taken, so the instrument would sit on
+    // its old sound for good. `sfLoadBusy` stays set and the next poll collects it as usual.
+}
+
+void AudioEngine::discardSoundfontLoad() {
+    if (!sfLoadBusy.load(std::memory_order_acquire)) return;
+    if (sfLoadThread.joinable()) sfLoadThread.join();
+
+    // ⚠️ Here the answer really is worthless: the project it was asked for is being torn down, so a
+    // slot given to it would belong to a document that no longer exists.
+    if (sfLoadHandle) {
+        tsf_close(sfLoadHandle);
+        sfLoadHandle = nullptr;
+    }
+    sfLoadDone.store(false, std::memory_order_relaxed);
+    sfLoadBusy.store(false, std::memory_order_release);
+}
+
+bool AudioEngine::soundfontSlotHolds(int slot, const char* path, int bank, int preset) {
+    if (slot < 0 || slot >= MAX_SOUNDFONTS || !path) return false;
+    std::lock_guard<std::mutex> sfLock(soundfonts[slot].mutex);
+    return soundfonts[slot].handle != nullptr && soundfonts[slot].filePath == path &&
+           soundfonts[slot].bank == bank && soundfonts[slot].preset == preset;
+}
+
+int AudioEngine::soundfontSlotCount() const { return MAX_SOUNDFONTS; }
+
+bool AudioEngine::soundfontSlotSound(int slot, std::string& path, int& bank, int& preset) {
+    if (slot < 0 || slot >= MAX_SOUNDFONTS) return false;
+    std::lock_guard<std::mutex> sfLock(soundfonts[slot].mutex);
+    if (!soundfonts[slot].handle) return false;
+    path   = soundfonts[slot].filePath;
+    bank   = soundfonts[slot].bank;
+    preset = soundfonts[slot].preset;
+    return true;
 }
 
 void AudioEngine::unloadSoundfont(int slot) {
@@ -2785,34 +3230,65 @@ void AudioEngine::unloadSoundfont(int slot) {
 }
 
 void AudioEngine::clearAllSoundfonts() {
+    // ⚠️ A load still in flight belongs to the project being thrown away. Waited for and discarded,
+    // or it would land in a slot the new project has to clear all over again.
+    discardSoundfontLoad();
+
     // Free EVERY slot — called when the project changes (NEW / load). The cache otherwise only
     // reclaims a slot on LRU eviction (one more distinct SF2 than there are slots), so a loaded SF2's
-    // float samples (≈2× its file size) would stay resident across NEW/load.
+    // samples (its 16-bit file bytes, resident) would stay across NEW/load.
     for (int s = 0; s < MAX_SOUNDFONTS; s++) freeSoundfontSlot(s);
     LOGD("🎹 Cleared all soundfont slots");
 }
 
-std::string AudioEngine::getSoundfontPresetName(int slot, int bank, int preset) {
-    if (slot < 0 || slot >= MAX_SOUNDFONTS) return "---";
-    std::lock_guard<std::mutex> sfLock(soundfonts[slot].mutex);
-    tsf* h = soundfonts[slot].handle;
-    if (!h) return "---";
-    const char* name = tsf_bank_get_presetname(h, bank, preset);
-    return name ? std::string(name) : std::string("---");
+// ─── the FILE's preset list ─────────────────────────────────────────────────────────────────────
+//
+// A loaded slot holds one preset, so it can no longer say what else the file contains. These read the
+// file's index instead — a few kilobytes even for a 200 MB bank, and no sample data at all, which is
+// what makes browsing a font that is far too large to load work exactly like browsing a small one.
+
+int AudioEngine::soundfontFileIndexSlot(const char* path) {
+    for (size_t i = 0; i < sfFileIndexCache.size(); ++i) {
+        if (sfFileIndexCache[i].path == path) return static_cast<int>(i);
+    }
+    std::vector<pt::SfPreset> presets;
+    if (!pt::sf_read_preset_list(path, presets)) return -1;
+
+    // Four files is more than the PATCH row can be walking at once; the oldest goes, and re-reading it
+    // costs one small read.
+    if (sfFileIndexCache.size() >= 4) sfFileIndexCache.erase(sfFileIndexCache.begin());
+    sfFileIndexCache.push_back({ std::string(path), std::move(presets) });
+    return static_cast<int>(sfFileIndexCache.size()) - 1;
 }
 
-bool AudioEngine::getSoundfontPresetAt(int slot, int index, int* bank, int* presetNumber) {
-    if (slot < 0 || slot >= MAX_SOUNDFONTS) return false;
-    std::lock_guard<std::mutex> sfLock(soundfonts[slot].mutex);
-    tsf* h = soundfonts[slot].handle;
-    return h && tsf_get_preset_at(h, index, bank, presetNumber);
+int AudioEngine::getSoundfontFilePresetCount(const char* path) {
+    if (!path) return 0;
+    std::lock_guard<std::mutex> lock(sfFileIndexMutex);
+    const int i = soundfontFileIndexSlot(path);
+    return (i < 0) ? 0 : static_cast<int>(sfFileIndexCache[static_cast<size_t>(i)].presets.size());
 }
 
-int AudioEngine::getSoundfontPresetCount(int slot) {
-    if (slot < 0 || slot >= MAX_SOUNDFONTS) return 0;
-    std::lock_guard<std::mutex> sfLock(soundfonts[slot].mutex);
-    tsf* h = soundfonts[slot].handle;
-    return h ? tsf_get_presetcount(h) : 0;
+bool AudioEngine::getSoundfontFilePresetAt(const char* path, int index, int* bank, int* presetNumber) {
+    if (!path || index < 0) return false;
+    std::lock_guard<std::mutex> lock(sfFileIndexMutex);
+    const int i = soundfontFileIndexSlot(path);
+    if (i < 0) return false;
+    const std::vector<pt::SfPreset>& list = sfFileIndexCache[static_cast<size_t>(i)].presets;
+    if (index >= static_cast<int>(list.size())) return false;
+    if (bank) *bank = list[static_cast<size_t>(index)].bank;
+    if (presetNumber) *presetNumber = list[static_cast<size_t>(index)].preset;
+    return true;
+}
+
+std::string AudioEngine::getSoundfontFilePresetName(const char* path, int bank, int preset) {
+    if (!path) return "---";
+    std::lock_guard<std::mutex> lock(sfFileIndexMutex);
+    const int i = soundfontFileIndexSlot(path);
+    if (i < 0) return "---";
+    for (const pt::SfPreset& p : sfFileIndexCache[static_cast<size_t>(i)].presets) {
+        if (p.bank == bank && p.preset == preset) return p.name.empty() ? std::string("---") : p.name;
+    }
+    return "---";
 }
 
 void AudioEngine::scheduleKill(int64_t targetFrame, int trackId) {
@@ -2836,6 +3312,12 @@ void AudioEngine::scheduleKeyRelease(int64_t targetFrame, int trackId) {
     kill.trackId     = trackId;
     kill.mode        = KILL_KEY_OFF;
     killQueue.schedule(kill);
+}
+
+void AudioEngine::scheduleReleaseAll(int64_t targetFrame) {
+    // Every lane, the preview one included — a render owns the whole engine, and a lane with nothing
+    // sounding on it costs one queue entry that finds no voice.
+    for (int t = 0; t < SF_VOICE_COUNT; ++t) scheduleKeyRelease(targetFrame, t);
 }
 
 void AudioEngine::clearScheduledNotes() {
@@ -2917,6 +3399,14 @@ void AudioEngine::getVoiceTableRows(int trackId, int out[TABLE_LANES]) {
     if (fading >= 0) lanesOf(voices[fading].lanes, out);
 }
 
+bool AudioEngine::getVoiceLoopWindow(int trackId, int* startFrame, int* endFrame) {
+    const int live = findTrackVoice(voices, trackId, /*fading=*/false);
+    if (live < 0) return false;
+    if (startFrame) *startFrame = voices[live].actualLoopStart;
+    if (endFrame)   *endFrame   = voices[live].actualLoopEnd;
+    return true;
+}
+
 int AudioEngine::getVoiceTableId(int trackId) {
     const int live = findTrackVoice(voices, trackId, /*fading=*/false);
     if (live >= 0) return voices[live].tableId;
@@ -2966,6 +3456,27 @@ void AudioEngine::scheduleVoiceFilterCut(int64_t targetFrame, int trackId, float
 
 void AudioEngine::scheduleVoiceFilterRes(int64_t targetFrame, int trackId, float res) {            // RES
     paramUpdateQueue.schedule({ targetFrame, trackId, 0, res, PARAM_UPDATE_FILTER_RES, 0.0f });
+}
+
+void AudioEngine::scheduleVoiceFilterMode(int64_t targetFrame, int trackId,                        // LPF/HPF/BPF
+                                          int type, float cut) {
+    paramUpdateQueue.schedule({ targetFrame, trackId, 0, cut, PARAM_UPDATE_FILTER_MODE, (float)type });
+}
+
+void AudioEngine::scheduleVoiceDrive(int64_t targetFrame, int trackId, float drive) {              // DRV
+    paramUpdateQueue.schedule({ targetFrame, trackId, 0, drive, PARAM_UPDATE_DRIVE, 0.0f });
+}
+
+void AudioEngine::scheduleVoiceCrush(int64_t targetFrame, int trackId, float packed) {             // CRU
+    paramUpdateQueue.schedule({ targetFrame, trackId, 0, packed, PARAM_UPDATE_CRUSH, 0.0f });
+}
+
+void AudioEngine::scheduleVoiceFineTune(int64_t targetFrame, int trackId, float fine) {            // FIN
+    paramUpdateQueue.schedule({ targetFrame, trackId, 0, fine, PARAM_UPDATE_FINE_TUNE, 0.0f });
+}
+
+void AudioEngine::scheduleVoiceLoopSlide(int64_t targetFrame, int trackId, float step) {           // LPO
+    paramUpdateQueue.schedule({ targetFrame, trackId, 0, step, PARAM_UPDATE_LOOP_SLIDE, 0.0f });
 }
 
 void AudioEngine::scheduleVoiceEqSlot(int64_t targetFrame, int trackId, int slot) {                // EQN
@@ -3401,9 +3912,35 @@ void AudioEngine::updateVoicePitchMod(Voice& voice, int numFrames, float sampleR
 
 float AudioEngine::getModulatedPlaybackRate(Voice& voice) {
     // modDestValues[PARAM_PITCH] accumulates: TABLE_PITCH + PITCH_SLIDE + VIBRATO + user mod slots.
+    // params.base[PARAM_PITCH] is FIN's fine tune — the same slot, its other half, cleared by every
+    // trigger. Read as a pair here so a fine tune and a table transpose add rather than replace.
     // voice.playbackRate has no transpose baked in; arpeggio adjusts it via setMidiNote().
-    float rateMod = powf(2.0f, voice.modDestValues[PARAM_PITCH] / 12.0f);
-    return voice.playbackRate * rateMod;
+    float rateMod = powf(2.0f,
+                         (voice.modDestValues[PARAM_PITCH] + voice.params.base[PARAM_PITCH]) / 12.0f);
+    const float rate = voice.playbackRate * rateMod;
+
+    // ── OSCILLATOR loop mode: one trip round the loop is one cycle of the played note ───────────
+    //
+    // ⭐⭐ **THE WHOLE MODE IS THIS ONE FACTOR, AND IT INHERITS EVERY PITCH SOURCE FOR FREE.**
+    // `rate × baseFrequency` is what the voice is sounding at right now — whatever moved it: the
+    // table transpose, FIN, a slide, vibrato, an arpeggio. Traversals per second is
+    // `rate × sampleRate / loopLength`, and the mode wants that to EQUAL the sounding frequency, so
+    // the rate is scaled by `loopLength × baseFrequency / sampleRate` and nothing else has to know.
+    //
+    // ⭐ The factor is 1.0 exactly when the loop is one cycle long at the sample's own base pitch —
+    // i.e. oscillator mode and forward mode agree precisely where you would expect them to, which is
+    // the arithmetic's own self-check.
+    //
+    // ⚠️ So in this mode the loop LENGTH is a TIMBRE control, not a pitch one: a longer window packs
+    // more of the file into each cycle. That is the opposite of a plain forward loop, where a short
+    // loop is what makes the pitch, and it is why LPO — which never changes the length — is the
+    // command this mode is built to be played with.
+    if (voice.loopMode == LOOP_MODE_OSCILLATOR && voice.baseFrequency > 0.0f) {
+        const int loopLength = voice.actualLoopEnd - voice.actualLoopStart;
+        const float sr = (float)getSampleRate();
+        if (loopLength > 0 && sr > 0.0f) return rate * ((float)loopLength * voice.baseFrequency / sr);
+    }
+    return rate;
 }
 
 void AudioEngine::renderOffline(int numFrames, float* output, int sampleRate) {
@@ -3447,4 +3984,102 @@ void AudioEngine::setOfflineRendering(bool offline) {
 void AudioEngine::setTempo(int tempo) {
     // Clamp to a sane musical range; the table-advance divides by this so it must be > 0.
     currentTempo.store(std::max(1, tempo), std::memory_order_relaxed);
+}
+
+// ─── The metronome ───────────────────────────────────────────────────────────────────────────────
+
+void AudioEngine::setMetronome(bool enabled, float gain) {
+    metronomeOn.store(enabled, std::memory_order_relaxed);
+    metronomeGain.store(std::max(0.0f, std::min(1.0f, gain)), std::memory_order_relaxed);
+}
+
+void AudioEngine::startMetronome(int64_t startFrame, int64_t framesPerBeat) {
+    metronomeBeatFrames.store(framesPerBeat > 0 ? framesPerBeat : 0, std::memory_order_relaxed);
+    metronomeEpoch.store(startFrame, std::memory_order_relaxed);
+}
+
+void AudioEngine::setMetronomeBeat(int64_t framesPerBeat) {
+    if (framesPerBeat > 0) metronomeBeatFrames.store(framesPerBeat, std::memory_order_relaxed);
+}
+
+void AudioEngine::stopMetronome() {
+    metronomeEpoch.store(-1, std::memory_order_relaxed);
+}
+
+void AudioEngine::renderMetronome(float* output, int numFrames, int channelCount, float sampleRate,
+                                  int64_t blockStartFrame, bool offlineRender) {
+    // An export carries the SONG, never the click that was helping the user write it. Also drops the
+    // click in flight, so a render started mid-beat cannot leak its tail into the first block back.
+    if (offlineRender) { metroClickPos_ = -1; return; }
+
+    const int64_t epoch = metronomeEpoch.load(std::memory_order_relaxed);
+    const int64_t beat  = metronomeBeatFrames.load(std::memory_order_relaxed);
+
+    if (epoch != metroEpoch_) {
+        // A new take. The grid is re-pinned to the transport's own start frame, which is what makes
+        // beat 0 the downbeat rather than "wherever the click happened to be".
+        metroEpoch_      = epoch;
+        metroBeatFrames_ = beat;
+        metroIndex_      = 0;
+        metroCount_      = 0;
+        metroClickPos_   = -1;
+    } else if (beat > 0 && beat != metroBeatFrames_) {
+        // TEMPO was turned mid-take. The epoch moves to where the NEXT beat was already going to
+        // fall and the index restarts, so that beat keeps its slot — no beat jumps, doubles or is
+        // lost — and every one after it takes the new spacing. songcore::MidiClock::rebase, same
+        // arithmetic and same reason.
+        metroEpoch_      = metroEpoch_ + metroIndex_ * metroBeatFrames_;
+        metroIndex_      = 0;
+        metroBeatFrames_ = beat;
+    }
+
+    if (!metronomeOn.load(std::memory_order_relaxed)) { metroClickPos_ = -1; return; }
+    const float gain = metronomeGain.load(std::memory_order_relaxed);
+    if (gain <= 0.0f) { metroClickPos_ = -1; return; }
+    if (metroEpoch_ < 0 || metroBeatFrames_ <= 0) return;   // nothing is playing
+
+    // ⚠️ The audio device can STALL AND RESUME — an Android suspend, a CFW power menu — and the frame
+    // counter then jumps by the whole stall at once. Walking the backlog one beat at a time would fire
+    // a click per block until it caught up; snap the grid to where the song actually is instead. The
+    // index still counts every beat the song passed, so the accent stays on the bar.
+    const int64_t behind = blockStartFrame - (metroEpoch_ + metroIndex_ * metroBeatFrames_);
+    if (behind > metroBeatFrames_) {
+        const int64_t skipped = behind / metroBeatFrames_;
+        metroIndex_ += skipped;
+        metroCount_ += skipped;
+    }
+
+    const int clickFrames = std::max(1, static_cast<int>(sampleRate * METRONOME_CLICK_SEC));
+
+    for (int i = 0; i < numFrames; i++) {
+        // A beat always restarts the click, rather than being dropped while one is still sounding:
+        // at 999 BPM a beat is shorter than the click, and a metronome that skips beats when it is
+        // pushed is worse than one that cuts its own tail.
+        if (blockStartFrame + i >= metroEpoch_ + metroIndex_ * metroBeatFrames_) {
+            const bool accent = (metroCount_ % METRONOME_BEATS_PER_BAR) == 0;
+            metroClickPhase_  = 0.0f;
+            metroClickStep_   = 2.0f * static_cast<float>(M_PI) *
+                                (accent ? METRONOME_ACCENT_HZ : METRONOME_BEAT_HZ) / sampleRate;
+            metroClickPos_    = 0;
+            metroIndex_++;
+            metroCount_++;
+        }
+        if (metroClickPos_ < 0) continue;
+
+        // A cubic decay from the first sample, which reaches exactly zero at the end of the window —
+        // an envelope that merely got small would step at the cut. The sine starts at phase 0, so
+        // there is no discontinuity at the onset either.
+        const float t   = static_cast<float>(metroClickPos_) / static_cast<float>(clickFrames);
+        const float env = (1.0f - t) * (1.0f - t) * (1.0f - t);
+        const float s   = sinf(metroClickPhase_) * env * gain;
+        metroClickPhase_ += metroClickStep_;
+        if (++metroClickPos_ >= clickFrames) metroClickPos_ = -1;
+
+        // Clamped, because this is summed BELOW the limiter: a loud mix plus a click can ask for more
+        // than the DAC has, and a hard clip on a 30 ms transient is inaudible where the wrap is not.
+        for (int ch = 0; ch < channelCount; ch++) {
+            float& out = output[i * channelCount + ch];
+            out = fmaxf(-1.0f, fminf(1.0f, out + s));
+        }
+    }
 }

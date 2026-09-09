@@ -430,9 +430,9 @@ inline CursorContext character(char current) {
  *
  * `type_count` is how many of the list this build lets you reach — fewer where the MIDI commands at
  * the end of it are hidden (ui/platform_caps.h `midi`). It bounds the coarse A+UP/A+DOWN step; the
- * picker that A+UP/A+DOWN opens is bounded by its own grid (ui/fx_helper.h). ⚠️ It clamps the CURSOR,
- * never the CELL: a step that already holds a hidden effect keeps it and keeps drawing it, because
- * the value came off disk and this build is not the one that authored it.
+ * picker that A+UP/A+DOWN opens is bounded by its own group lists (ui/fx_helper.h). ⚠️ It clamps
+ * the CURSOR, never the CELL: a step that already holds a hidden effect keeps it and keeps drawing
+ * it, because the value came off disk and this build is not the one that authored it.
  */
 inline CursorContext effect_type(int current_type, int fx_slot,
                                  int type_count = songcore::EFFECT_TYPE_COUNT) {
@@ -634,10 +634,20 @@ inline InputAction decrement(const CursorContext& c) {
     return InputAction::none();
 }
 
+/**
+ * The fast pair FALLS BACK to the small step on a cell that declares no fast one — a short cycle
+ * (a preset list, a scale, SLICE, SOURCE, an on/off flag, a name character) then answers A+UP/DOWN
+ * exactly as it answers A+RIGHT/LEFT, instead of answering nothing.
+ *
+ * ⚠️ Derived here rather than by setting `largeStep = 1` in each cycle factory, so a factory added
+ * later inherits it. It also keeps the CONTEXT each factory builds byte-for-byte what it was.
+ */
 inline InputAction increment_fast(const CursorContext& c) {
     if (!c.is_editable() || c.capabilities.isEmpty) return InputAction::none();
     if (c.capabilities.canIncrementFast)
         return InputAction::set_value(step_value(c.currentValue, c.largeStep, c));
+    if (c.capabilities.canIncrement)
+        return InputAction::set_value(step_value(c.currentValue, c.smallStep, c));
     return InputAction::none();
 }
 
@@ -645,6 +655,8 @@ inline InputAction decrement_fast(const CursorContext& c) {
     if (!c.is_editable() || c.capabilities.isEmpty) return InputAction::none();
     if (c.capabilities.canDecrementFast)
         return InputAction::set_value(step_value(c.currentValue, -c.largeStep, c));
+    if (c.capabilities.canDecrement)
+        return InputAction::set_value(step_value(c.currentValue, -c.smallStep, c));
     return InputAction::none();
 }
 

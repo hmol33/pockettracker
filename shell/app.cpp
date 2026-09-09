@@ -7,6 +7,7 @@
 
 #include "audio-backend.h"
 #include "audio-engine.h"
+#include "load_progress.h"   // set_load_tick — where a slow load reports itself
 #include "songcore/host.h"
 #include "ui/app_state.h"
 #include "ui/button_mapper.h"
@@ -16,6 +17,7 @@
 #include "ui/input_dispatcher.h"
 #include "ui/layout.h"
 #include "ui/modules/oscilloscope.h"   // WAVEFORM_SIZE — the C7 audible test
+#include "ui/scale_io.h"              // seed_scale_bank — the factory scales, as .pts files
 #include "ui/settings_store.h"
 
 #include "device_skin.h"
@@ -365,6 +367,7 @@ int run(const AppConfig& cfg) {
     filesystem.instruments_directory();
     filesystem.soundfonts_directory();
     filesystem.themes_directory();
+    filesystem.scales_directory();
     std::printf("files:   %s\n", cfg.appRoot.c_str());
 
     // ⚠️ The app's OWN files need not live in the tree just named — on Android they do not, because
@@ -521,6 +524,18 @@ int run(const AppConfig& cfg) {
     // no template. This is the whole reason `default_keyboard_bindings()` exists.
     if (ui::seed_config_template(filesystem, SdlInput::default_keyboard_bindings()))
         std::printf("config:   seeded template %s\n", filesystem.config_path().c_str());
+
+    // ── The factory scales, as files ──────────────────────────────────────────────────────────────
+    //
+    // The bank the SCALE screen cycles is compiled in and works with or without these; what the files
+    // add is that a shape can be edited, renamed and carried to another device. Written only when the
+    // folder holds no `.pts` at all, so a user who has pruned the list keeps their pruning.
+    //
+    // ⚠️ The count is PRINTED, because this is the one thing here with no signal inside the app: a seed
+    // that silently wrote nothing looks exactly like a seed that had nothing to do.
+    if (const int seeded = ui::seed_scale_bank(filesystem); seeded > 0)
+        std::printf("files:   seeded %d factory scales in %s\n", seeded,
+                    filesystem.scales_directory().c_str());
 
     // `folders` → the dispatcher's browse start dirs. An override is root-relative unless absolute,
     // is re-rooted when it was authored under another install's root, and falls back to the built-in
@@ -707,6 +722,11 @@ int run(const AppConfig& cfg) {
                              ui::modal_backdrop_active(state) ? ui::MODAL_BACKDROP : 0);
     };
 
+    // Declared here rather than beside the frame loop because `load_pump` below has to be able to
+    // stop the app: an SDL_QUIT that arrives while a load is running must not be swallowed with the
+    // rest of the queue.
+    bool running = true;
+
     ui::InputDispatcher::RenderHooks hooks;
     hooks.suspend_audio = [&audio](bool suspend) { audio.setPaused(suspend); };
     // A SYNCHRONOUS repaint — the "RENDERING... 43%" / "RESAMPLING..." readout the dispatcher pushes on
@@ -717,7 +737,67 @@ int run(const AppConfig& cfg) {
         layout.draw(canvas, state);
         present_current();
     };
+
+    // ── The pump a LOAD runs instead of the frame loop ────────────────────────────────────────────
+    //
+    // While a load is in flight the frame loop is inside it, so nothing is polling. This is what
+    // polls, and it buys three separate things that all needed the same call:
+    //
+    //   1. **The lifecycle stays alive.** `SDL_APP_WILLENTERBACKGROUND` is delivered from inside
+    //      SDL's own pump, and `on_app_event` — the watcher that flushes the crash-recovery autosave
+    //      on a Home press — fires synchronously from there. A loop that has stopped polling has
+    //      silently switched that off, which made a long load a window in which work could be lost.
+    //   2. **Queued presses are CONSUMED rather than replayed.** Without this SDL keeps every button
+    //      pressed during the wait and delivers them in one burst when it ends, onto whatever screen
+    //      the load returned to. (Still true of EXPORT, which does not pump — see the plan doc.)
+    //   3. **B cancels.**
+    //
+    // ⚠️⚠️ **IT DELIBERATELY DOES NOT CALL `handle_button`.** The presses are read for exactly one
+    // question and then dropped. Dispatching them would be re-entering the dispatcher from inside a
+    // dispatcher call, on a document the load is halfway through rewriting — and `Overlay::LOADING`
+    // makes every handler inert anyway, so the only thing running them could add is that risk.
+    //
+    // ⚠️ SDL_QUIT is honoured, not consumed: a window close or a SIGTERM translation arriving here
+    // has to reach the loop, or the app finishes the load and then ignores the kill. It also cancels,
+    // so the load unwinds instead of holding the process open for its full length.
+    hooks.load_pump = [&]() -> bool {
+        bool cancel = false;
+        const Uint64 now = SDL_GetTicks64();
+
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) {
+                running = false;
+                cancel  = true;
+            } else if (e.type == SDL_FINGERDOWN || e.type == SDL_FINGERUP ||
+                       e.type == SDL_FINGERMOTION) {
+                touch.handle_finger(e, input, now);
+            } else {
+                input.handle_event(e, now);
+            }
+        }
+        input.tick(now);
+
+        // ⚠️ The queue is DRAINED whatever it holds — a press left in it would fire on the screen
+        // underneath the moment the load ended. B is the one that means anything here, and it is the
+        // PRESS edge, so a B still held from before the load started cannot cancel it by itself.
+        ui::ButtonEvent be;
+        while (input.poll(be))
+            if (be.button == ui::Button::B && be.action == ui::ButtonAction::PRESSED) cancel = true;
+
+        return cancel;
+    };
     dispatch.set_render_hooks(std::move(hooks));
+
+    // ⚠️ **INSTALLED ONCE, AND ONLY BY THE SHELL.** Everything below `pt::load_tick` — the five
+    // decoders, the WAV reader and tsf's sample decode — reports through this and behaves exactly as
+    // it did before it existed when nothing is installed, which is the case for every tool and for
+    // the offline render. The clock is passed IN rather than read by the dispatcher: `set_now()`
+    // also runs due work, and the 3 s autosave firing from inside a project load would write the
+    // recovery file from a half-loaded document.
+    pt::set_load_tick([&dispatch](float fraction) {
+        return dispatch.load_tick(static_cast<long long>(SDL_GetTicks64()), fraction);
+    });
 
     // ── THE LIFECYCLE (S10) ──────────────────────────────────────────────────────────────────────
     //
@@ -797,7 +877,6 @@ int run(const AppConfig& cfg) {
         std::printf("  START still auditions underneath, so you can sweep a band across a ringing note\n\n");
     }
 
-    bool   running    = true;
     Uint64 lastStatus = 0;
 
     // ── ⚠️ DEV BRING-UP ONLY: the two hooks that make a TIMED run scriptable (phase B3) ───────────
@@ -891,9 +970,11 @@ int run(const AppConfig& cfg) {
     // `audibleEdge`  — audio was audible LAST frame, so the first silent frame is still drawn once
     //                  (Kotlin's active→idle bump; without it the scope freezes mid-wave).
     // `drewOnce`     — the first frame always draws, or the window comes up empty until a keypress.
-    bool sawInput    = false;
-    bool audibleEdge = true;
-    bool drewOnce    = false;
+    // `timedWorkEdge`— the SAME active→idle bump, for the dispatcher's timers. See the gate.
+    bool sawInput      = false;
+    bool audibleEdge   = true;
+    bool timedWorkEdge = false;
+    bool drewOnce      = false;
 
     // ⚠️ **THE NUMBERS BESIDE THE VERDICT, AND C7 IS UNVERIFIABLE WITHOUT THEM.** A working idle skip
     // and a skip that never fires look IDENTICAL on screen — that is the whole point of it, the
@@ -1390,6 +1471,20 @@ int run(const AppConfig& cfg) {
         // resolved on TABLE. `now` because the meters poll on their own 60 ms cadence, not per frame.
         feed.poll(engineRef, host, state, static_cast<long long>(now));
 
+        // ── SETTINGS > METRONOME, pushed live ────────────────────────────────────────────────────
+        //
+        // Read here, once a frame, rather than pushed from the row that edits it — the same shape
+        // `touch.set_feedback_settings` uses above and for the same reason: two atomic stores cost
+        // nothing, and there is then no mutation site that has to remember to tell the engine. The
+        // GRID (the transport epoch and the beat length) comes from the host, which is the only thing
+        // that knows when a take started; this is only the switch and the level.
+        //
+        // 0x80 lands at -12 dBFS, which sits over a full mix without asking for headroom the master
+        // has already spent. The click is summed below the limiter (audio-engine.h), so the scale is
+        // the finished output's, not the mix bus's.
+        engineRef.setMetronome(state.settings.metronomeEnabled,
+                               static_cast<float>(state.settings.metronomeVolume) / 255.0f * 0.5f);
+
         // ⚠️ **SETTINGS > SCALING, APPLIED — AND UNTIL C4 NOTHING APPLIED IT.** `scalingBilinear` was
         // read from settings.json, written back to it, and drawn as the `SCALING: BILINEAR/INT` row,
         // and `SdlVideo::set_scaling` had ZERO call sites in the entire tree: the video stayed on its
@@ -1427,7 +1522,7 @@ int run(const AppConfig& cfg) {
         // lifecycle watcher all still run every frame at 60 Hz. Kotlin could afford `delay(50L)` when
         // idle because its visualizer was a separate coroutine; here that would be 50 ms of input lag.
         // ⚠️ `has_pending_timed_work()` is the third term and it is NOT covered by the pixel net: the
-        // status line clears itself 5 s after it is set, with no input, and a frame that is never
+        // status line clears itself 3 s after it is set, with no input, and a frame that is never
         // drawn is never compared. Without it a "PROJECT SAVED" would sit on a still screen forever.
         //
         // ⚠️ `resizeSettle` is the FOURTH, and it is a rotation/resize term the pixel net cannot cover
@@ -1447,6 +1542,15 @@ int run(const AppConfig& cfg) {
         // drawn, so a closed gate strands whatever was on screen. See TrackerLayout::has_falling_meters:
         // every term is gated there on its module being drawn at all, since nothing off-screen ages and
         // nothing would ever bring this term back to false.
+        // ⚠️⚠️ **`timedWorkEdge` IS THE SIXTH, AND WITHOUT IT THE THIRD TERM MISSES BY EXACTLY ONE
+        // FRAME — WHICH IS THE WHOLE FRAME THAT MATTERS.** `set_now()` (above) is what clears an
+        // expired status message, and it clears the DEADLINE in the same call. So on the one frame
+        // where the message actually goes away, `has_pending_timed_work()` has already gone false and
+        // the gate closes: the state is clean, the pixels still read "PROJECT SAVED", and they stay
+        // that way until the next input. Reported from the device, on both platforms — a message that
+        // sits on a still screen until a button is touched. This is `audibleEdge`'s shape applied to
+        // the same edge: the frame after the work finishes is still drawn once.
+        const bool timedWork = dispatch.has_pending_timed_work();
         const bool metersFalling = layout.has_falling_meters(state);
         const bool audible = audio_is_audible(state);
         const bool settling = resizeSettle > 0;
@@ -1455,7 +1559,7 @@ int run(const AppConfig& cfg) {
             --resizeSettle;
         }
         if (audible || audibleEdge || sawInput || !drewOnce || settling || metersFalling ||
-            dispatch.has_pending_timed_work()) {
+            timedWork || timedWorkEdge) {
             layout.draw(canvas, state);
             ++drawn;
 
@@ -1477,8 +1581,9 @@ int run(const AppConfig& cfg) {
             // idle path costs MORE than the busy one. See SdlVideo::pace().
             video.idle_frame();
         }
-        audibleEdge = audible;   // so the first silent frame is still drawn (the flattened scope)
-        sawInput    = false;
+        audibleEdge   = audible;     // so the first silent frame is still drawn (the flattened scope)
+        timedWorkEdge = timedWork;   // …and the frame a timer's own work vanishes on
+        sawInput      = false;
 
         // A status line once a second, kept from the Phase 2 shell and kept for the same reason: on a
         // headless box, over ssh, or during a handheld bring-up where you cannot yet see or hear

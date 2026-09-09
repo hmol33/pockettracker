@@ -82,7 +82,7 @@ inline const std::vector<std::string>& filter_types() {
     return v;
 }
 inline const std::vector<std::string>& loop_modes() {
-    static const std::vector<std::string> v{"off", "fwd", "png"};
+    static const std::vector<std::string> v{"off", "fwd", "png", "osc"};
     return v;
 }
 
@@ -96,6 +96,11 @@ struct InstrumentEditorState {
     std::string sfPresetName{};
     int         sfPresetCount = 0;
     int         sfPresetIndex = 0;
+
+    // Whether the LOOP cycle may be stepped onto `osc` (platform_caps.h `loopWindow`). Only the
+    // cursor asks — `draw` reads the instrument's own string, so a slot already set to `osc` keeps
+    // saying so on every build.
+    bool allowOscLoop = true;
 
     Theme theme = theme_classic();
 
