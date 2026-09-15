@@ -603,17 +603,36 @@ void AudioEngine::applySampleFx(int id, int fxType, int fxValue, float sampleRat
                 for (int i = 0; i < n; i++) buf[pos + i] = stereo[i * 2];
             }
         } else if (fxType == 1) { // DUST
+            // ⚠️ DUST delays its output by `latencySamples()` and nothing inside it compensates that.
+            // On the master bus the shift is constant and inaudible; HERE it is baked into the file,
+            // so an uncompensated apply would push the sound later, leave silence at the head and
+            // drop the tail — and a second apply would double it.
+            //
+            // So the chain is run over `len + latency` frames, fed silence once the sample ends, and
+            // output frame `j` is written back at `j - latency`. The sample keeps its start, its tail
+            // survives, and applying twice lands in the same place as applying once.
+            const int latency = skdust::DustChain::latencySamples();
+            // Writes trail reads by exactly `latency`, so each chunk overwrites only samples it has
+            // already copied into `stereo` — true while the latency is shorter than one chunk.
+            static_assert(skdust::DustChain::latencySamples() < CHUNK,
+                          "a latency of a chunk or more would overwrite unread input");
+
             skdust::DustChain dust;
             dust.prepare((double)sampleRate, CHUNK, 2);
             dust.setDustAmount(fxValue / 255.0f);
-            for (int pos = 0; pos < len; pos += CHUNK) {
-                int n = std::min(CHUNK, len - pos);
+            for (int pos = 0; pos < len + latency; pos += CHUNK) {
+                int n = std::min(CHUNK, len + latency - pos);
                 for (int i = 0; i < n; i++) {
-                    stereo[i * 2]     = buf[pos + i];
-                    stereo[i * 2 + 1] = buf[pos + i];
+                    const int src = pos + i;
+                    const float s = (src < len) ? buf[src] : 0.0f;   // silence past the end
+                    stereo[i * 2]     = s;
+                    stereo[i * 2 + 1] = s;
                 }
                 dust.process(stereo, n, 2);
-                for (int i = 0; i < n; i++) buf[pos + i] = stereo[i * 2];
+                for (int i = 0; i < n; i++) {
+                    const int dst = pos + i - latency;
+                    if (dst >= 0 && dst < len) buf[dst] = stereo[i * 2];
+                }
             }
         } else if (fxType == 2) { // DRIVE
             DriveModule drive;
@@ -757,8 +776,9 @@ void AudioEngine::setInstrumentSendLevels(int instrId, int reverbSend, int delay
     instrumentParams[instrId].delaySend  = delaySend  / 255.0f;
 }
 
-void AudioEngine::setReverbParams(int feedbackHex, int dampHex, int wetHex) {
-    reverbSend.setParams(feedbackHex, dampHex);
+void AudioEngine::setReverbParams(int feedbackHex, int dampHex, int wetHex, int decayHex,
+                                   int densityHex) {
+    reverbSend.setParams(feedbackHex, dampHex, decayHex, densityHex);
     reverbReturnGain = wetHex / 255.0f;
 }
 
@@ -771,9 +791,19 @@ void AudioEngine::setDelayParams(int timeOrSubdiv, int feedbackHex, bool syncMod
     delayReturnGain = wetHex / 255.0f;
 }
 
+void AudioEngine::setDelayCharacter(bool pong, int toneHex, int wobbleHex) {
+    delaySend.setCharacter(pong, toneHex, wobbleHex);
+}
+
 void AudioEngine::setDelayReverbSend(int sendHex) {
     delayToReverbSend = sendHex / 255.0f;
 }
+
+void AudioEngine::setReverbCharacter(int preHex, int widthHex, int modHex) {
+    reverbSend.setCharacter(preHex, widthHex, modHex);
+}
+
+void AudioEngine::setReverbAlgo(int algo) { reverbSend.setAlgo(algo); }
 
 void AudioEngine::setReverbInputEq(int slot) { applyEqPresetToModule(reverbSend.inputEq, slot); }
 

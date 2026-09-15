@@ -16,6 +16,7 @@
 #include <climits>   // INT_MAX — tsf_load_memory takes an int size
 #include <cstring>
 #include <new>
+#include <vector>
 // MSVC defines neither __SSE2__ nor __x86_64__ — it signals x86/x64 with _M_X64 / _M_IX86 — so the
 // host build would silently lose denormal protection without these arms. SSE2 is baseline on x64.
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86) && _M_IX86_FP >= 2)
@@ -1400,21 +1401,31 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
     // that is set once per block, which is the very staircase this removes.
     float gateStart[SF_VOICE_COUNT];
     float gateEnd[SF_VOICE_COUNT];
+    // The same pair for the three BUS gates — the two send returns and the dry sum. See setBusMutes().
+    float revGateStart, revGateEnd, dlyGateStart, dlyGateEnd, dryGateStart, dryGateEnd;
     float masterVolSnapshot;
     int previewTrack;
     {
         std::lock_guard<std::mutex> lock(volumeMutex);
         // Per full swing, so the ramp is the same wall-clock length whatever the block size.
         const float gateStep = (float)numFrames / (float)MUTE_GATE_SAMPLES;
+        // One walk for every gate in the mixer, so a return cannot end up ramping differently from a
+        // track. `gate` is the member that remembers where it got to; start/end bracket THIS block.
+        const auto walk_gate = [&](float& gate, bool muted, float& start, float& end) {
+            const float target = muted ? 0.0f : 1.0f;
+            if (offlineRender) gate = target;   // a mute is a STATE in an export, not a gesture
+            start = gate;
+            if      (gate < target) gate = fminf(target, gate + gateStep);
+            else if (gate > target) gate = fmaxf(target, gate - gateStep);
+            end = gate;
+        };
         for (int t = 0; t < 8; t++) {
             trackVolSnapshot[t] = trackVolumes[t];
-            const float target  = trackMuted[t] ? 0.0f : 1.0f;
-            if (offlineRender) trackGate[t] = target;   // a mute is a STATE in an export, not a gesture
-            gateStart[t] = trackGate[t];
-            if      (trackGate[t] < target) trackGate[t] = fminf(target, trackGate[t] + gateStep);
-            else if (trackGate[t] > target) trackGate[t] = fmaxf(target, trackGate[t] - gateStep);
-            gateEnd[t]   = trackGate[t];
+            walk_gate(trackGate[t], trackMuted[t], gateStart[t], gateEnd[t]);
         }
+        walk_gate(revReturnGate,   revReturnMuted,   revGateStart, revGateEnd);
+        walk_gate(delayReturnGate, delayReturnMuted, dlyGateStart, dlyGateEnd);
+        walk_gate(dryGate,         dryMuted,         dryGateStart, dryGateEnd);
         masterVolSnapshot = masterVolume;
         previewTrack      = previewLaneTrack;
     }
@@ -2162,8 +2173,7 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
             } else {
                 float rawStart   = voice.params.base[PARAM_SAMPLE_START] + voice.modDestValues[PARAM_SAMPLE_START];
                 float rawEnd     = voice.params.base[PARAM_SAMPLE_END]   + voice.modDestValues[PARAM_SAMPLE_END];
-                voice.actualStart = std::max(0,             std::min((int)(rawStart * sl / 255.0f), sl - 2));
-                voice.actualEnd   = std::max(voice.actualStart + 1, std::min((int)(rawEnd * sl / 255.0f), sl - 1));
+                derive_sample_window(rawStart, rawEnd, sl, voice.actualStart, voice.actualEnd);
             }
             float rawLoop    = voice.params.base[PARAM_LOOP_START]   + voice.modDestValues[PARAM_LOOP_START];
             voice.actualLoopStart = std::max(voice.actualStart, std::min((int)(rawLoop * sl / 255.0f), voice.actualEnd - 1));
@@ -2334,27 +2344,47 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
             procL *= scalar;
             procR *= scalar;
 
+            // ⚠️⚠️ **THE VOICE'S OWN FADES MUST REACH THE SENDS, AND THE TRACK FADER MUST NOT.**
+            // They are two different things that used to sit on the same side of the tap:
+            //
+            //   * `antiClick` and the KIL/steal fade-out are the VOICE's envelope — the ramps that
+            //     exist so a note never starts or stops on a discontinuity. A send that misses them
+            //     receives a waveform cut off mid-cycle, so a KIL that is clean on the dry signal
+            //     puts a click into the reverb and delay tails, which then ring on for seconds.
+            //   * `trackVol` is the MIXER fader, and it stays below the tap on purpose: sends are
+            //     pre-fader, so pulling a track down leaves its tails at full level (see below).
+            //
+            // The fade is resolved HERE, once, because it advances a counter and ends the voice —
+            // and it is applied to the dry path in its original position and order below, so the
+            // dry signal is arithmetically untouched by this.
+            const bool fading = voice.isFadingOut;
+            float voiceFade   = antiClick;
+            float fo          = 1.0f;
+            if (fading) {
+                fo = (float)voice.fadeOutRemaining / (float)voice.fadeOutTotal;
+                voiceFade *= fo;
+                if (--voice.fadeOutRemaining <= 0) {
+                    voice.isFadingOut = false;
+                    voice.isActive = false;
+                }
+            }
+
             if ((stemsMode == 0 || stemsMode >= 9) && voice.reverbSend > 0.0f) {
-                revSendBufL[i] += procL * panL * voice.reverbSend;
-                revSendBufR[i] += procR * panR * voice.reverbSend;
+                revSendBufL[i] += procL * voiceFade * panL * voice.reverbSend;
+                revSendBufR[i] += procR * voiceFade * panR * voice.reverbSend;
             }
             if ((stemsMode == 0 || stemsMode >= 9) && voice.delaySend > 0.0f) {
-                dlySendBufL[i] += procL * panL * voice.delaySend;
-                dlySendBufR[i] += procR * panR * voice.delaySend;
+                dlySendBufL[i] += procL * voiceFade * panL * voice.delaySend;
+                dlySendBufR[i] += procR * voiceFade * panR * voice.delaySend;
             }
 
             float globalMul = trackVol * antiClick;
             procL *= globalMul;
             procR *= globalMul;
 
-            if (voice.isFadingOut) {
-                float fo = (float)voice.fadeOutRemaining / (float)voice.fadeOutTotal;
+            if (fading) {
                 procL *= fo;
                 procR *= fo;
-                if (--voice.fadeOutRemaining <= 0) {
-                    voice.isFadingOut = false;
-                    voice.isActive = false;
-                }
             }
 
             float sampleL = procL * panL;
@@ -2659,6 +2689,22 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
         }
     }
 
+    // ─── THE DRY GATE — every track's audio, summed, BELOW every send tap ────────────────────────
+    //
+    // ⚠️ It has to live here and nowhere else. Soloing a send return means "let me hear only what comes
+    // back from the reverb", and the reverb is fed by the tracks: taking the dry mix down as eight track
+    // mutes would stop the notes (both schedulers skip an inaudible track) and cut the SoundFont path's
+    // send with them, so the soloed return would have nothing to return. Everything above has already
+    // tapped the sends; this multiply is what the listener loses.
+    if (dryGateStart < 1.0f || dryGateEnd < 1.0f) {
+        for (int i = 0; i < numFrames; i++) {
+            const float lerp_t = (numFrames > 1) ? (float)(i + 1) / (float)numFrames : 1.0f;
+            const float g      = dryGateStart + (dryGateEnd - dryGateStart) * lerp_t;
+            output[i * channelCount]     *= g;
+            output[i * channelCount + 1] *= g;
+        }
+    }
+
     // SEND BUSES: delay first so its output can feed into reverb, then reverb
     {
         // revWet*/dlyWet* are engine members; process() fully overwrites them.
@@ -2684,10 +2730,16 @@ void AudioEngine::processAudioBlock(float* output, int numFrames, int channelCou
             }
         }
         for (int i = 0; i < numFrames; i++) {
-            float rv  = revWetL[i] * reverbReturnGain;
-            float rvR = revWetR[i] * reverbReturnGain;
-            float dl  = dlyWetL[i] * delayReturnGain;
-            float dlR = dlyWetR[i] * delayReturnGain;
+            // ⚠️ The return's own mute rides HERE, below the module, so a muted reverb keeps building
+            // its tail while it is silent — unmuting drops you back into the tail the song has been
+            // feeding it, not into a reverb that starts from nothing.
+            const float lerp_t = (numFrames > 1) ? (float)(i + 1) / (float)numFrames : 1.0f;
+            const float rvGate = revGateStart + (revGateEnd - revGateStart) * lerp_t;
+            const float dlGate = dlyGateStart + (dlyGateEnd - dlyGateStart) * lerp_t;
+            float rv  = revWetL[i] * reverbReturnGain * rvGate;
+            float rvR = revWetR[i] * reverbReturnGain * rvGate;
+            float dl  = dlyWetL[i] * delayReturnGain * dlGate;
+            float dlR = dlyWetR[i] * delayReturnGain * dlGate;
             if (stemsMode == 0) {
                 output[i * channelCount]     += rv + dl;
                 output[i * channelCount + 1] += rvR + dlR;
@@ -3544,29 +3596,74 @@ static const int SPECTRUM_FFT_SIZE = 2048;
 
 // Shared FFT helper — takes FFT_SIZE samples already copied from the circular buffer by the caller
 // (under mutex), applies Hann window + FFT, maps to numBins log-spaced magnitude values [0,1].
-static void computeSpectrumFFT(kiss_fft_scalar* input, int numBins, float* out, float sampleRate) {
-    for (int i = 0; i < SPECTRUM_FFT_SIZE; i++) {
-        float w = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (SPECTRUM_FFT_SIZE - 1)));
-        input[i] *= w;
-    }
+// ⚠️ The two tables below are FUNCTION-LOCAL STATICS WITH NO LOCK, on the same terms as the FFT
+// config: every caller is the single UI poll thread. A second calling thread would need more than a
+// mutex here — it would need a slot of its own, because the bin map is chosen per call.
+//
+// Neither table depends on the audio, and recomputing them per call cost more than the transform:
+// measured at 2048 points / 620 bins, 14 us of window and 25 us of bin mapping against 17 us of FFT.
+// Caching both halves the cost of a poll, which is what lets the EQ panel run at frame rate for less
+// than it used to cost at 20 Hz.
 
-    // Cache the config across calls: kiss_fftr_alloc does a malloc + twiddle-table trig init
-    // every time. All callers are the single UI poll thread (~20 fps while the EQ screen is open),
-    // so a function-local static is safe and removes that per-call churn. FFT size is constant,
-    // so the cfg lives for the process (never freed).
-    static kiss_fftr_cfg cfg = kiss_fftr_alloc(SPECTRUM_FFT_SIZE, 0, nullptr, nullptr);
-    kiss_fft_cpx cpx_out[SPECTRUM_FFT_SIZE / 2 + 1];
-    kiss_fftr(cfg, input, cpx_out);
+static const float* spectrum_hann_window() {
+    static float w[SPECTRUM_FFT_SIZE];
+    static const bool built = [] {
+        for (int i = 0; i < SPECTRUM_FFT_SIZE; i++)
+            w[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (SPECTRUM_FFT_SIZE - 1)));
+        return true;
+    }();
+    (void)built;
+    return w;
+}
+
+// Which FFT bin each output bin reads. Depends only on (numBins, sampleRate), and the live consumers
+// ask for different counts — the EQ panel and the visualizer strip — so a single slot would thrash
+// between them and rebuild on every call. Four slots, replaced round-robin on a miss.
+static const int* spectrum_bin_map(int numBins, float sampleRate) {
+    struct Entry {
+        int              numBins    = 0;
+        float            sampleRate = 0.0f;
+        std::vector<int> idx;
+    };
+    static Entry cache[4];
+    static int   next = 0;
+
+    for (Entry& e : cache)
+        if (e.numBins == numBins && e.sampleRate == sampleRate) return e.idx.data();
+
+    Entry& e = cache[next];
+    next = (next + 1) % 4;
+    e.numBins    = numBins;
+    e.sampleRate = sampleRate;
+    e.idx.resize((size_t)numBins);
 
     const float fMin = 20.0f, fMax = 20000.0f;
     const float logRange = logf(fMax / fMin);
-
+    const float denom    = (numBins > 1) ? (float)(numBins - 1) : 1.0f;
     for (int bi = 0; bi < numBins; bi++) {
-        float t    = (float)bi / (numBins - 1);
+        float t    = (float)bi / denom;
         float freq = fMin * expf(t * logRange);
         int bin    = (int)(freq * SPECTRUM_FFT_SIZE / sampleRate + 0.5f);
         if (bin < 1)                      bin = 1;
         if (bin >= SPECTRUM_FFT_SIZE / 2) bin = SPECTRUM_FFT_SIZE / 2 - 1;
+        e.idx[(size_t)bi] = bin;
+    }
+    return e.idx.data();
+}
+
+static void computeSpectrumFFT(kiss_fft_scalar* input, int numBins, float* out, float sampleRate) {
+    const float* window = spectrum_hann_window();
+    for (int i = 0; i < SPECTRUM_FFT_SIZE; i++) input[i] *= window[i];
+
+    // Cache the config across calls: kiss_fftr_alloc does a malloc + twiddle-table trig init
+    // every time. FFT size is constant, so the cfg lives for the process (never freed).
+    static kiss_fftr_cfg cfg = kiss_fftr_alloc(SPECTRUM_FFT_SIZE, 0, nullptr, nullptr);
+    kiss_fft_cpx cpx_out[SPECTRUM_FFT_SIZE / 2 + 1];
+    kiss_fftr(cfg, input, cpx_out);
+
+    const int* binOf = spectrum_bin_map(numBins, sampleRate);
+    for (int bi = 0; bi < numBins; bi++) {
+        const int bin = binOf[bi];
 
         float re  = cpx_out[bin].r;
         float im  = cpx_out[bin].i;
@@ -3730,6 +3827,13 @@ void AudioEngine::setTrackMuted(int trackId, bool muted) {
     // both mix paths walk their gate to it over MUTE_GATE_SAMPLES, so a mute lands in ~5.8 ms rather
     // than in one sample. Voices keep running underneath — a mute is a gate, never a stop.
     LOGD("🔇 Track %d %s", trackId, muted ? "muted" : "unmuted");
+}
+
+void AudioEngine::setBusMutes(bool revMuted, bool dlyMuted, bool dryBusMuted) {
+    std::lock_guard<std::mutex> lock(volumeMutex);
+    revReturnMuted   = revMuted;
+    delayReturnMuted = dlyMuted;
+    dryMuted         = dryBusMuted;
 }
 
 void AudioEngine::setMasterVolume(float volume) {

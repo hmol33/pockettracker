@@ -609,9 +609,55 @@ struct Project {
     int ottDepth = 0, masterBusFx = 0, dustDepth = 0, limiterPreGain = 0;
     std::vector<EqPreset> eqPresets;              // Array(128){EqPreset(it)} — filled by factory
     int reverbFeedback = 0x60, reverbDamp = 0x80, reverbWet = 0x80, reverbInputEq = -1;
+    // The reverb's character — three independent cells, no mode between them. The TYPE row on the
+    // EFFECTS screen writes these, SIZE, DAMP, DCAY and DENS all at once from a preset, and then reads
+    // the name back by matching (effects/modules/reverb-presets.h); it is not stored, because after
+    // one turn of any of the seven there is nothing for it to be.
+    //
+    // ⚠️⚠️ **THESE DEFAULTS ARE THE REVERB THAT SHIPPED, and PRE and WIDE have to stay that way**: a
+    // project written before the cells existed loads without them, so the default is what it plays
+    // with. PRE is 00 (no line at all, not a short one) and WIDE is 80 (the mid/side pair SKIPPED, not
+    // performed). ⚠️ MOD is the exception and is deliberately BELOW the 40 the algorithm was fixed at:
+    // a wander sized for a long tail is audible as detuning on a short one.
+    int reverbPreDelay = 0x00, reverbWidth = 0x80, reverbMod = 0x10;
+    // Which reverb algorithm sounds. ⚠️⚠️ **0 IS THE ONE THAT SHIPPED AND ITS NUMBER IS ITS IDENTITY**
+    // — append, never insert. A project written before the cell existed loads without it and lands
+    // here, so 0 must go on meaning exactly the reverb it has always meant.
+    //
+    // ⚠️ The cells above are NOT rewritten when this changes: each algorithm reads them its own
+    // way (effects/modules/reverb-presets.h), so a project keeps the numbers the user typed and hears
+    // them differently. That is why this is a field of its own and not a sixth preset row.
+    int reverbAlgo = 0;
+    // The two cells only algorithm 1 has, and they are hidden on the EFFECTS screen while algorithm 0
+    // is chosen. ⚠️ They are stored and serialized regardless, so switching away and back does not
+    // lose them — and a preset writes them on BOTH algorithms, so picking one while algorithm 0 is
+    // chosen moves two cells that are not on screen.
+    //
+    // ⚠️⚠️ **DCAY's DEFAULT IS THE SAME 0x60 AS SIZE'S ON PURPOSE.** Before it was a cell, algorithm 1
+    // derived its decay from the SIZE cell through the same curve — so a project that never touches
+    // DCAY plays the tail it played when the two were welded together, and splitting them changed no
+    // existing sound. ⚠️ DENS 0x99 is 0.6, which is the density the tank was voiced at when it was a
+    // constant, and for the same reason.
+    int reverbDecay = 0x60, reverbDensity = 0x99;
     int delayTime = 0x40;
     bool delaySync = false;
     int delayFeedback = 0x60, delayWet = 0x80, delayReverbSend = 0x00, delayInputEq = -1;
+    // The delay's character — three independent cells, no mode between them. The TYPE row on the
+    // EFFECTS screen writes all three at once from a preset and then reads the name back by matching
+    // (effects/modules/delay-presets.h); it is not stored, because after one turn of any of these
+    // there is nothing for it to be.
+    //
+    // ⚠️⚠️ **THESE DEFAULTS ARE THE DELAY THAT SHIPPED, and they have to stay that way**: a project
+    // written before the cells existed loads without them, so the default is what it plays with. TONE
+    // is FF (the filter switched OUT, not merely open) and WOBL is 00.
+    bool delayPong = false;
+    int  delayTone = 0xFF, delayWobble = 0x00;
+    // The two send RETURNS are mixer channels like the eight tracks, and they carry the same pair of
+    // performance flags. ⚠️ A SOLO here is a statement about the RETURNS and the dry sum, never about
+    // which tracks play: the notes feeding a soloed return must go on sounding, so this is deliberately
+    // not folded into `track_audible` — see `dry_audible` below.
+    bool reverbMute = false, reverbSolo = false;
+    bool delayMute  = false, delaySolo  = false;
     int masterEqSlot = -1;
     std::vector<Phrase>     phrases;              // Array(256){Phrase(it)}
     std::vector<Chain>      chains;               // Array(256){Chain(it)}
@@ -660,6 +706,49 @@ inline bool track_audible(const Project& p, const Track& t) {
 inline bool track_audible(const Project& p, int trackId) {
     if (trackId < 0 || trackId >= static_cast<int>(p.tracks.size())) return false;
     return track_audible(p, p.tracks[static_cast<size_t>(trackId)]);
+}
+
+// ── …and which of the two SEND RETURNS is ────────────────────────────────────────────────────────
+//
+// The same shape as the tracks above, derived for the same reason, but a SEPARATE solo set. Soloing a
+// track leaves the returns alone (the reverb is still fed, by the one track that plays); soloing a
+// return must not stop any track, because a return with nothing feeding it is silence — a solo into a
+// hole. So the two sets meet only at the DRY sum, which is what a soloed return takes down.
+inline bool any_send_solo(const Project& p) { return p.reverbSolo || p.delaySolo; }
+
+inline bool reverb_return_audible(const Project& p) {
+    return !p.reverbMute && (p.reverbSolo || !any_send_solo(p));
+}
+
+inline bool delay_return_audible(const Project& p) {
+    return !p.delayMute && (p.delaySolo || !any_send_solo(p));
+}
+
+/** Is the dry mix heard? A soloed return silences it — unless a TRACK is soloed too, which asks for
+ *  that track's dry signal alongside the return. */
+inline bool dry_audible(const Project& p) { return !any_send_solo(p) || any_solo(p); }
+
+// ── The mixer's ten channels ─────────────────────────────────────────────────────────────────────
+//
+// 0-7 are the song tracks, 8 and 9 the reverb and delay returns — the MIXER screen draws all ten as
+// strips, and a mute/solo gesture names one of them. ⚠️ Resolved in ONE place so that a chord's
+// snapshot, its toggle and its undo cannot disagree about where a channel's two flags live.
+constexpr int MIX_CH_REVERB = 8;
+constexpr int MIX_CH_DELAY  = 9;
+
+struct MixChannelFlags {
+    bool* mute = nullptr;
+    bool* solo = nullptr;
+};
+
+inline MixChannelFlags mix_channel_flags(Project& p, int ch) {
+    if (ch == MIX_CH_REVERB) return {&p.reverbMute, &p.reverbSolo};
+    if (ch == MIX_CH_DELAY)  return {&p.delayMute, &p.delaySolo};
+    if (ch >= 0 && ch < static_cast<int>(p.tracks.size())) {
+        Track& t = p.tracks[static_cast<size_t>(ch)];
+        return {&t.mute, &t.solo};
+    }
+    return {};
 }
 
 struct InstrumentPreset {

@@ -116,10 +116,14 @@ void push_global_effects(Engine& engine, const Project& project, MixerHeld held 
             engine.setEqBand(slot, band, b.type, b.freq, b.gain, b.q);
         }
     }
-    engine.setReverbParams(project.reverbFeedback, project.reverbDamp, project.reverbWet);
+    engine.setReverbAlgo(project.reverbAlgo);
+    engine.setReverbParams(project.reverbFeedback, project.reverbDamp, project.reverbWet,
+                           project.reverbDecay, project.reverbDensity);
+    engine.setReverbCharacter(project.reverbPreDelay, project.reverbWidth, project.reverbMod);
     engine.setReverbInputEq(project.reverbInputEq);
     engine.setDelayParams(project.delayTime, project.delayFeedback, project.delaySync,
                           static_cast<float>(project.tempo), project.delayWet);
+    engine.setDelayCharacter(project.delayPong, project.delayTone, project.delayWobble);
     engine.setDelayInputEq(project.delayInputEq);
     engine.setDelayReverbSend(project.delayReverbSend);
     // The bank above is safe to re-push at any moment — `setEqBand` writes only the 128-slot store,
@@ -142,6 +146,10 @@ void push_mixer(Engine& engine, const Project& project, MixerHeld held = {}) {
         // it is what the SONG may have moved; the mute is what the user just typed.
         engine.setTrackMuted(i, !track_audible(project, i));
     }
+    // The other three channels the mute/solo chord can name, and never gated by `held` for the same
+    // reason the line above is not: on a press of the chord, this line IS the press.
+    engine.setBusMutes(!reverb_return_audible(project), !delay_return_audible(project),
+                       !dry_audible(project));
     if (!held.masterFader) engine.setMasterVolume(hex_to_float(project.masterVolume));
     engine.setOttDepth(project.ottDepth);
     engine.setMasterFx(project.masterBusFx);
@@ -509,24 +517,34 @@ bool request_instrument_soundfont(Engine& engine, const Instrument& ins, Routing
     return true;
 }
 
-/** Install a finished background load. Call it once a frame; it is free when nothing has finished. */
+/**
+ * Install a finished background load. Call it once a frame; it is free when nothing has finished.
+ *
+ * Returns the instrument whose slot MOVED, or -1. ⚠️ The caller needs that answer: which slot an
+ * instrument plays out of is read when a note is SCHEDULED, two phrases before it is heard, so a sound
+ * installed mid-take is inaudible until every note bound to the old slot has played. Only the caller
+ * holds the transport, so only the caller can shorten that.
+ */
 template <typename Engine>
-void collect_instrument_soundfont(Engine& engine, const Project& project, Routing& routing) {
+int collect_instrument_soundfont(Engine& engine, const Project& project, Routing& routing) {
     int id = -1, slot = -1;
-    if (!engine.collectSoundfontLoad(&id, &slot)) return;
-    if (id < 0 || id >= static_cast<int>(project.instruments.size())) return;
+    if (!engine.collectSoundfontLoad(&id, &slot)) return -1;
+    if (id < 0 || id >= static_cast<int>(project.instruments.size())) return -1;
 
     // ⚠️ **THE ROW MAY HAVE MOVED ON WHILE THIS DECODED**, so what was asked for is not necessarily
     // what is wanted. Checked against the instrument as it is NOW: a slot the document no longer names
     // is left unrouted, and the sweep below reclaims it. Routing a stale answer would put the
     // instrument back on a preset the user has already scrolled past.
     const Instrument& ins = project.instruments[static_cast<size_t>(id)];
+    bool moved = false;
     if (slot >= 0 && ins.instrumentType == InstrumentType::SOUNDFONT &&
         ins.soundfontPath.has_value() &&
         engine.soundfontSlotHolds(slot, ins.soundfontPath->c_str(), ins.sfBank, ins.sfPreset)) {
+        moved = routing.sfSlot[id] != slot;
         routing.sfSlot[id] = slot;
     }
     release_unreferenced_soundfonts(engine, routing);
+    return moved ? id : -1;
 }
 
 /**

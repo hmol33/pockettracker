@@ -367,7 +367,7 @@ Works on the SONG and MIXER screens, while playing or stopped.
 
 | Input | Action |
 |---|---|
-| R + B | Mute / unmute the track under the cursor |
+| R + B | Mute / unmute the channel under the cursor |
 | R + A | Solo / unsolo it |
 | R + B or R + A over a selection | Applies to every track the selection covers |
 | L + R | Restore full playback on all tracks |
@@ -387,6 +387,10 @@ soloed.
 
 A track that is making no sound draws its numbers dimmed — its chain IDs on SONG, its fader value on
 MIXER — so soloing one track dims the other seven.
+
+**The send returns.** On MIXER the chord also works on the REV and DEL strips. Muting one drops that
+effect out of the mix; soloing one leaves you with just the reverb or just the delay, while the
+tracks go on playing and feeding it.
 
 ---
 
@@ -1234,8 +1238,15 @@ Navigate here: **R+DOWN** from MIXER, or **R+DOWN** twice from any Row 2 screen.
 
 | Parameter | Description |
 |---|---|
-| SIZE | Room size (`00`–`FF`). Higher = longer reverb tail. |
-| DAMP | High-frequency damping (`00`–`FF`). Higher = darker reverb. |
+| TYPE | A starting point for the whole section: **NORMAL** (the plain reverb), **ROOM** (tight, bright, close), **HALL** (a gap, then a long dark tail), **CAVE** (longest, darkest, widest). Choosing one sets every cell in the section together — including DCAY and DENS, which only MVERB shows; turn any of them afterwards and TYPE reads **USER**. |
+| ALGO | Which reverb runs: **OLD**, an even wash, or **MVERB**, a denser tail with audible early reflections. Switching leaves every cell exactly as you set it — but SIZE and MOD mean different things to each, so the same numbers sound different, and MVERB shows two extra cells the old reverb has no counterpart for. Switching back returns the sound you had. |
+| PRE | Pre-delay (`00`–`FF`) — a gap of up to 150 ms before the tail starts, so the sound stays in front of it. `00` starts it immediately. Same on both algorithms. |
+| SIZE | On **OLD**, the length of the tail (`00`–`FF`), about half a second to about twenty-five; `FF` never ends. On **MVERB**, the size of the *room* — how far apart its walls are — while DCAY below sets how long it rings. The level stays where it is as you turn it. |
+| WIDE | Stereo width of the return (`00`–`FF`). `00` is mono, `80` leaves the image as the reverb makes it, `FF` pushes it to the sides. The level does not change with it. Same on both algorithms. |
+| DAMP | Brightness of the tail (`00`–`FF`). `00` is dark, `FF` keeps the highs. Same on both algorithms. |
+| DCAY | **MVERB only**, and not shown on OLD. How long the tail rings (`00`–`FF`), separate from the room — so a small room can ring for a long time, or a big one die away fast. About half a second to about four; `FF` never ends. |
+| DENS | **MVERB only**, and not shown on OLD. How thick the reverb is (`00`–`FF`). Low is sparse and grainy, with the individual echoes audible; high smears them into a smooth wash. |
+| MOD / EARLY | On **OLD** it is labelled MOD and is movement in the tail (`00`–`FF`) — higher makes it drift in pitch, `00` holds it still, which is bright and metallic. On **MVERB** it is labelled EARLY and is how much of the early reflections you hear: `00` is the tail alone, `FF` is mostly the sound of the walls. |
 | EQ | Press A to open the EQ EDITOR for the reverb return. |
 
 The reverb return volume is set on the MIXER screen (REV row in master column).
@@ -1244,10 +1255,18 @@ The reverb return volume is set on the MIXER screen (REV row in master column).
 
 | Parameter | Description |
 |---|---|
+| TYPE | A starting point for the three character cells: **NORMAL** (the plain delay), **PING** (bouncing), **TAPE** (dark, drifting repeats). Choosing one sets PONG, TONE and WOBL together; turn any of those afterwards and TYPE reads **USER**. |
+| PONG | Repeats alternate left and right instead of echoing on their own side (`ON` / `OFF`). |
 | TIME | Delay time. **SYNC off:** free time `00`–`FF` = 0–2000 ms. **SYNC on:** `00`–`0B` selects a BPM-locked subdivision (1/1 … 1/16.). Press **B** on this row to switch between the two. |
+| TONE | How bright the repeats stay (`00`–`FF`). Lower darkens each repeat more than the one before it; `FF` leaves them untouched. |
 | FDBK | Feedback amount (`00`–`FF`). Higher = more repeats. |
+| WOBL | How far the tape speed drifts (`00`–`FF`), bending the pitch of the repeats. `00` holds them steady. |
 | REV | Amount of delay output sent into the reverb bus (`00`–`FF`). Delay is processed before reverb, so this cross-routing is zero-latency. |
 | EQ | Press A to open the EQ EDITOR for the delay return. |
+
+> [!NOTE]
+> **PONG places the repeats itself**, so it ignores where the instrument is panned — the bounce is
+> always left, right, left. With PONG off, an echo stays on the side its instrument sits on.
 
 The delay return volume is set on the MIXER screen (DEL row in master column).
 

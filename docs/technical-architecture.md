@@ -230,6 +230,18 @@ Reverb and delay are **send buses**, not inserts: a per-note or per-instrument s
 them, and the delay can additionally feed the reverb. Both have their own input EQ. `-1` is the
 documented bypass value for every EQ slot.
 
+The reverb holds **two algorithms resident at once and sounds one of them**, chosen by a per-project
+`reverbAlgo` whose number is its identity — append, never insert, and 0 is the algorithm that shipped.
+Only the tail is switched: the pre-delay ring and the mid/side width pair sit **outside** both, so PRE
+and WIDE have one implementation and one meaning either way. ⚠️ The other three cells do **not** cross
+— each algorithm owns its own reading of SIZE, DAMP and MOD, which is why every mapping is a named
+function in `reverb-presets.h` rather than arithmetic inside `setParams`. Switching the cell rewrites
+none of them. Two further cells belong to the second algorithm alone and are the screen's only
+conditional rows: they are stored and serialized whatever is selected, and **hidden rather than drawn
+dead** while the first is (`effects_row_layout.h` — skipped, never renumbered). ⚠️ Both being resident is deliberate: only one can sound, but a swap cannot allocate or
+free on the audio thread, so the ~390 KB is paid inside an `AudioEngine` that is heap-allocated for
+exactly this class of reason.
+
 Note where the two faders sit relative to that tap. A send is **pre-fader with respect to the track
 fader** and post-everything on the instrument, so pulling a track down leaves its tails alone. The
 **master fader is downstream of the returns** — it multiplies the summed bus, dry and wet together,
@@ -317,6 +329,13 @@ muted is gated rather than stopped, and a scheduler that stops triggering has no
 when the gate lifts — unmuting mid-phrase brings back that one stale note and holds it until the next
 phrase boundary. The offline render is the single exception, deliberately: `scheduleSongRowRange`
 skips an inaudible track outright, because an export is a file you keep.
+
+The chord addresses ten channels, not eight: the reverb and delay **returns** carry the same mute and
+solo flags, in a solo set of their own — soloing a track must leave the returns alone, and soloing a
+return must not stop a track. A soloed return silences the dry mix through one gate over the summed
+bus, placed below every send tap and above the returns. Expressing that as eight track mutes would
+starve the return being soloed: the SoundFont send tap sits below its track's gate, and the offline
+render skips an inaudible track outright, so the reverb would be soloed into silence.
 
 **LIVE mode is a modifier on SONG, not a fifth transport mode.** The mode changes only what happens at
 a track's boundary — a launched song row re-enters itself instead of the cursor moving down the column

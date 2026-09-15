@@ -329,6 +329,17 @@ enum class HelpTopic {
     SET_METRONOME,
     SET_METRONOME_VOL,
     PROJECT_TAP,
+    FX_DELAY_TYPE,
+    FX_DELAY_TONE,
+    FX_DELAY_WOBBLE,
+    FX_DELAY_PONG,
+    FX_REVERB_TYPE,
+    FX_REVERB_PRE,
+    FX_REVERB_WIDE,
+    FX_REVERB_MOD,
+    FX_REVERB_ALGO,
+    FX_REVERB_DECAY,
+    FX_REVERB_DENSITY,
 
     COUNT
 };
@@ -455,7 +466,7 @@ inline constexpr HelpEntry HELP_ENTRIES[] = {
     /* INST_LOOP_START */
     {"LOOP ST: where a loop begins", "The point playback jumps back", "to. Needs LOOP switched on."},
     /* INST_SAMPLE_END */
-    {"END: where playback stops", "FF is the end of the file.", "Below that it cuts short."},
+    {"END: where playback stops", "Below FF it cuts short. Set", "under START to play to the end."},
     /* INST_LOOP_END */
     {"LOOP END: where a loop ends", "The point playback jumps back", "from. Needs LOOP on."},
     /* INST_REVERSE */
@@ -561,9 +572,9 @@ inline constexpr HelpEntry HELP_ENTRIES[] = {
     /* MIXER_MASTER_VOL */
     {"MIX: the master volume", "Everything passes through it", "on the way out."},
     /* MIXER_REVERB_RETURN */
-    {"REV: the reverb return", "How loud the shared reverb", "comes back into the mix."},
+    {"REV: the reverb return", "How loud the reverb comes", "back. R+B mutes, R+A solos."},
     /* MIXER_DELAY_RETURN */
-    {"DEL: the delay return", "How loud the shared delay", "comes back into the mix."},
+    {"DEL: the delay return", "How loud the delay comes", "back. R+B mutes, R+A solos."},
     /* MIXER_MASTER_EQ */
     {"EQ: the master EQ preset", "A slot, 00 to 7F, or --.", "A opens the EQ editor."},
     /* MIXER_MASTER_FX */
@@ -792,6 +803,28 @@ inline constexpr HelpEntry HELP_ENTRIES[] = {
     {"VOL: how loud the click is", "00 is silent, FF is full.", ""},
     /* PROJECT_TAP */
     {"TAP: set the tempo by feel", "Press A in time, at least twice.", "A pause starts a new count."},
+    /* FX_DELAY_TYPE */
+    {"TYPE: a starting point", "Sets the three cells below.", "Change one and it says USER."},
+    /* FX_DELAY_TONE */
+    {"TONE: how bright repeats are", "Lower makes each echo darker", "than the one before it."},
+    /* FX_DELAY_WOBBLE */
+    {"WOBL: tape speed wobble", "Makes the echoes drift in", "pitch. 00 holds them steady."},
+    /* FX_DELAY_PONG */
+    {"PONG: echoes bounce", "Repeats alternate left and", "right, ignoring the pan."},
+    /* FX_REVERB_TYPE */
+    {"TYPE: a starting point", "Sets the cells around it.", "Change one and it says USER."},
+    /* FX_REVERB_PRE */
+    {"PRE: a gap before the tail", "The reverb starts late, so the", "sound stays in front of it."},
+    /* FX_REVERB_WIDE */
+    {"WIDE: how far it spreads", "00 is mono, 80 is normal,", "FF pushes it to the sides."},
+    /* FX_REVERB_MOD */
+    {"MOD / EARLY: set by ALGO", "OLD: the tail drifts in pitch.", "MVERB: how much of the walls."},
+    /* FX_REVERB_ALGO */
+    {"ALGO: which reverb sounds", "OLD is the soft wash. MVERB", "puts walls around the sound."},
+    /* FX_REVERB_DECAY */
+    {"DCAY: how long it rings", "MVERB only. Separate from the", "room, so a small one can ring."},
+    /* FX_REVERB_DENSITY */
+    {"DENS: how thick it is", "MVERB only. Low is grainy and", "sparse, high is smooth."},
 };
 
 // ─── The compile-time check on the table ─────────────────────────────────────────────────────────
@@ -1099,7 +1132,7 @@ inline HelpTopic mixer_cell_topic(int master_row, int column) {
     return HelpTopic::NONE;
 }
 
-/** EFFECTS — eight editable rows, named by the module so the two cannot disagree about which is which. */
+/** EFFECTS — the editable rows, named by the module so the two cannot disagree about which is which. */
 inline HelpTopic effects_cell_topic(int row) {
     switch (row) {
         case EffectModule::ROW_MASTER_TYPE: return HelpTopic::FX_MASTER_TYPE;
@@ -1110,6 +1143,17 @@ inline HelpTopic effects_cell_topic(int row) {
         case EffectModule::ROW_DLY_FDBK:    return HelpTopic::FX_DELAY_FEEDBACK;
         case EffectModule::ROW_DLY_REV:     return HelpTopic::FX_DELAY_TO_REVERB;
         case EffectModule::ROW_DLY_EQ:      return HelpTopic::FX_DELAY_EQ;
+        case EffectModule::ROW_DLY_TYPE:    return HelpTopic::FX_DELAY_TYPE;
+        case EffectModule::ROW_DLY_TONE:    return HelpTopic::FX_DELAY_TONE;
+        case EffectModule::ROW_DLY_WOBBLE:  return HelpTopic::FX_DELAY_WOBBLE;
+        case EffectModule::ROW_DLY_PONG:    return HelpTopic::FX_DELAY_PONG;
+        case EffectModule::ROW_REV_TYPE:    return HelpTopic::FX_REVERB_TYPE;
+        case EffectModule::ROW_REV_PRE:     return HelpTopic::FX_REVERB_PRE;
+        case EffectModule::ROW_REV_WIDE:    return HelpTopic::FX_REVERB_WIDE;
+        case EffectModule::ROW_REV_MOD:     return HelpTopic::FX_REVERB_MOD;
+        case EffectModule::ROW_REV_ALGO:    return HelpTopic::FX_REVERB_ALGO;
+        case EffectModule::ROW_REV_DECAY:   return HelpTopic::FX_REVERB_DECAY;
+        case EffectModule::ROW_REV_DENSITY: return HelpTopic::FX_REVERB_DENSITY;
         default:                            return HelpTopic::NONE;
     }
 }
