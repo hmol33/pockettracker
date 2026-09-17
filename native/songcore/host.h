@@ -339,7 +339,11 @@ class SongcoreHost {
         external_.panic();
         if (engine_) {
             engine_->clearScheduledNotes();   // the lookahead: notes, kills AND param updates
-            engine_->stopAll();               // …and the voices already sounding (instant — no fade)
+            // …and the voices already sounding. RAMPED, not cut: a sustained note ended where its
+            // waveform happens to be is a full-scale step, and it is handed to the instrument's
+            // filter, the reverb and delay sends and the master bus on its way out. The audio thread
+            // finishes the ramp — the voices are still sounding when this returns.
+            engine_->stopAllRamped();
             engine_->stopMetronome();         // …and the click, which is not queued and not a voice
         }
         consumer_.clear_track_mask();   // Kotlin clears phraseTrackMask in clearScheduledNotes/stopAll
@@ -448,7 +452,9 @@ class SongcoreHost {
     MediaLoadResult load_media(const std::string& baseDir) {
         lastMediaLoad_ = MediaLoadResult();
         if (!engine_) return lastMediaLoad_;
-        lastMediaLoad_ = load_project_media(*engine_, project_, baseDir, appRoot_, routing_);
+        mediaRoots_.baseDir = baseDir;
+        lastMediaLoad_ =
+            load_project_media(*engine_, project_, baseDir, mediaRoots_.appRoot, routing_);
         return lastMediaLoad_;
     }
 
@@ -473,7 +479,7 @@ class SongcoreHost {
      * ⚠️ Leave it UNSET and every load behaves exactly as before — which is precisely what the host tools
      * do, so their goldens do not move. Only a caller that sets it gets the relocation.
      */
-    void set_app_root(std::string root) { appRoot_ = std::move(root); }
+    void set_app_root(std::string root) { mediaRoots_.appRoot = std::move(root); }
 
     // ── ↓ the LIVE param push (engine_setup.h) ───────────────────────────────────────────────────
     //
@@ -614,20 +620,23 @@ class SongcoreHost {
     // is loaded — and they read the FILE's index, so they also answer for a bank too large to load.
     int sf_preset_count(int id) const {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return 0;
-        return soundfont_preset_count(*engine_, project_.instruments[static_cast<size_t>(id)]);
+        return soundfont_preset_count(*engine_, project_.instruments[static_cast<size_t>(id)],
+                                      mediaRoots_);
     }
     int sf_preset_index(int id) const {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return 0;
-        return soundfont_preset_index(*engine_, project_.instruments[static_cast<size_t>(id)]);
+        return soundfont_preset_index(*engine_, project_.instruments[static_cast<size_t>(id)],
+                                      mediaRoots_);
     }
     std::string sf_preset_name(int id) const {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return "---";
-        return soundfont_preset_name(*engine_, project_.instruments[static_cast<size_t>(id)]);
+        return soundfont_preset_name(*engine_, project_.instruments[static_cast<size_t>(id)],
+                                     mediaRoots_);
     }
     void set_sf_preset_by_index(int id, int index) {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return;
         songcore::set_soundfont_preset_by_index(*engine_, project_.instruments[static_cast<size_t>(id)],
-                                                index);
+                                                index, mediaRoots_);
     }
 
     /**
@@ -639,7 +648,7 @@ class SongcoreHost {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return;
         const int was = routing_.sfSlot[id];
         songcore::sync_instrument_soundfont(*engine_, project_.instruments[static_cast<size_t>(id)],
-                                            routing_);
+                                            routing_, mediaRoots_);
         if (routing_.sfSlot[id] != was) notify_sf_slot_moved();
     }
 
@@ -651,7 +660,7 @@ class SongcoreHost {
         if (!engine_ || id < 0 || id >= POOL_INSTRUMENTS) return true;
         const int was = routing_.sfSlot[id];
         const bool taken = songcore::request_instrument_soundfont(
-            *engine_, project_.instruments[static_cast<size_t>(id)], routing_);
+            *engine_, project_.instruments[static_cast<size_t>(id)], routing_, mediaRoots_);
         // An already-resident preset is answered on the spot rather than by the worker, and that
         // answer moves the slot here instead of in poll_sf_load.
         if (routing_.sfSlot[id] != was) notify_sf_slot_moved();
@@ -661,7 +670,7 @@ class SongcoreHost {
     /** Install a finished background preset load. Called once a frame by the feed. */
     void poll_sf_load() {
         if (!engine_) return;
-        if (songcore::collect_instrument_soundfont(*engine_, project_, routing_) >= 0)
+        if (songcore::collect_instrument_soundfont(*engine_, project_, routing_, mediaRoots_) >= 0)
             notify_sf_slot_moved();
     }
 
@@ -840,7 +849,7 @@ class SongcoreHost {
         if (j.is_discarded() || !j.is_object()) return false;
 
         const InstrumentPreset ip = parse_instrument_preset(j);
-        const bool sourceOk = apply_instrument_preset(engine_, project_, id, ip, routing_);
+        const bool sourceOk = apply_instrument_preset(engine_, project_, id, ip, routing_, mediaRoots_);
         invalidate_tables();   // the preset may have brought a table with it
         push_instrument(id);
         return sourceOk;
@@ -872,6 +881,8 @@ class SongcoreHost {
     // ── Reading the sample (the feed) ────────────────────────────────────────────────────────────
     int  sample_length(int id) const { return engine_ ? engine_->getSampleLength(id) : 0; }
     bool has_stereo_data(int id) const { return engine_ && engine_->hasStereoData(id); }
+    /** The depth the slot's sample came in at — the ceiling of the editor's BIT cell. */
+    int  sample_bit_depth(int id) const { return engine_ ? engine_->getSampleBitDepth(id) : 16; }
 
     /** The FILE's rate (deviceRate / ratio); 44100 when the slot is empty. See sample_edit.h. */
     int sample_rate_of(int id) const { return original_sample_rate(engine_, routing_, id); }
@@ -962,8 +973,8 @@ class SongcoreHost {
     }
 
     // ── The three that move the ratio, and therefore live in songcore (sample_edit.h) ────────────
-    void apply_rate_mode(int id, int factor) {
-        songcore::apply_rate_mode(engine_, routing_, rateCache_, id, factor);
+    void apply_rate_and_bits(int id, int factor, int bits) {
+        songcore::apply_rate_and_bits(engine_, routing_, rateCache_, id, factor, bits);
     }
     void pitch_shift_sample(int id, float semitones) {
         songcore::pitch_shift_sample(engine_, rateCache_, id, semitones);
@@ -1037,17 +1048,32 @@ class SongcoreHost {
     // ── SAVE and CHOP ────────────────────────────────────────────────────────────────────────────
 
     /** The edited PCM → a WAV at `path`, with its slice boundaries in the `cue ` chunk. */
+    /** `bits` 0 = the depth the sample was loaded at. */
     bool save_sample_wav(int id, const std::string& path, const std::vector<int>& cuePoints,
-                         int sourceMode, bool hasStereo) {
+                         int sourceMode, bool hasStereo, int bits = 0) {
         if (!engine_) return false;
-        return songcore::save_sample_wav(*engine_, routing_, id, path, cuePoints, sourceMode, hasStereo);
+        return songcore::save_sample_wav(*engine_, routing_, id, path, cuePoints, sourceMode, hasStereo,
+                                         bits);
+    }
+
+    /**
+     * After a SAVE that left the slot's buffer in place: that buffer is now what the file holds, so its
+     * depth becomes the saved one and the RATE/BIT original — and the ratio it would restore — are
+     * dropped. Left behind, the next session's first touch of RATE or BIT would bring back the audio
+     * from before the save.
+     */
+    void adopt_saved_sample(int id, int bits) {
+        if (!engine_) return;
+        const int depth = songcore::resolve_save_bits(*engine_, id, bits);
+        engine_->adoptSavedSampleFormat(id, depth, depth == 32 && engine_->isSampleFloat(id));
+        rateCache_.clear(id);
     }
 
     /** Every slice → its own WAV in `dir`. Returns how many were written. */
     int chop_sample(int id, const std::string& dir, const std::string& baseName,
-                    const std::vector<std::pair<int64_t, int64_t>>& slices) {
+                    const std::vector<std::pair<int64_t, int64_t>>& slices, int bits = 0) {
         if (!engine_) return 0;
-        return songcore::chop_sample(*engine_, routing_, id, dir, baseName, slices);
+        return songcore::chop_sample(*engine_, routing_, id, dir, baseName, slices, bits);
     }
 
     // ── ↕ live editing — the SDL shell's UI *is* the editing model ────────────────────────────────
@@ -1363,7 +1389,7 @@ class SongcoreHost {
     void resync_soundfont_slots() {
         if (!engine_) return;
         for (const Instrument& ins : project_.instruments)
-            songcore::sync_instrument_soundfont(*engine_, ins, routing_);
+            songcore::sync_instrument_soundfont(*engine_, ins, routing_, mediaRoots_);
     }
 
     /**
@@ -1471,7 +1497,8 @@ class SongcoreHost {
 
     Project project_ = make_default_project();
     std::string projectSha_ = "-";
-    std::string appRoot_;   // set_app_root(); "" ⇒ no media re-rooting (the tools' default)
+    // set_app_root() plus the last load_media(); both empty ⇒ no resolving at all (the tools' default)
+    MediaRoots mediaRoots_;
     Routing routing_;
 
     /**

@@ -732,6 +732,8 @@ Move the selection start and end markers to define a region for operations.
 | D-pad (on start/end marker row) | Move the active marker |
 | A + UP/DOWN | Jump marker by large step |
 
+A moved marker lands on the nearest **zero crossing** — the quietest place to cut, so a loop or a crop does not click. LEFT and RIGHT search their own channel, MONO the downmix, and STEREO looks for a frame where **both** channels are quiet.
+
 ### Non-destructive parameters
 
 These change playback behaviour without modifying the waveform data:
@@ -740,7 +742,7 @@ These change playback behaviour without modifying the waveform data:
 |---|---|---|
 | SOURCE | LEFT / RIGHT / STEREO / MONO | Which channel(s) of a stereo WAV to use. Non-destructive — never alters the file. SAVE/OVERWRITE applies SOURCE at write time. Opens on **STEREO** whenever the file has a right channel; a mono file reads MONO and the cell cannot be moved. |
 | RATE | HIGH / NORM / LOFI | Sample rate mode. NORM = original. LOFI = 8-bit lo-fi downsampling. |
-| SNAP | ON / OFF | With SNAP on, a selection edge you move lands on the nearest **zero crossing** instead of the exact frame — the quietest place to cut, and the way to avoid a click at the seam of a loop or a crop. It looks in the signal the cut will actually be made in: LEFT and RIGHT search their own channel, MONO searches the downmix it will save, and STEREO looks for the frame where **both** channels are quiet. Turn it off when you want a frame exactly where you put it. |
+| BIT | 32 / 24 / 16 / 8 | Bits per sample. Opens at the depth the file came in at, and offers only that depth and lower — a 16-bit file shows 16 / 8, a 24-bit one 24 / 16 / 8. Lower depths round the sound to coarser steps for grit. **SAVE, OVERWRITE and CHOP write the file at the depth shown.** It combines with RATE, and either can be set back while the editor is open. Not the instrument's CRUSH. |
 
 ### Destructive operations
 
@@ -822,7 +824,7 @@ where a plain A makes a new boundary.
 | A + B | MANUAL: delete it. TRANSIENT / DIVIDE: put it back where the mode had placed it |
 | A *(while the sample plays)* | MANUAL: cut a boundary at the playhead |
 
-Both steps scale with the zoom, as the selection edges do, and **SNAP** applies the same way.
+Both steps scale with the zoom, as the selection edges do, and a boundary lands on a zero crossing the same way.
 
 Under MANUAL the slice counter reaches one past the last slice: that slot is the next boundary, sitting
 on the one to its left, and moving it off is what creates it. A boundary may be dragged past its
@@ -1391,7 +1393,7 @@ All value rows are edited with **A + D-pad**. A single **A** press is reserved f
 | CURSOR | REMEMBER / REFRESH | Whether cursor position is preserved when switching between screens. |
 | NAV | POOL / SONG | What B + D-pad walks. **SONG** (the default) walks the arrangement: the cursor is a song cell, and the chain and phrase on screen are the ones that cell holds. **POOL** steps through the 00–FF chain and phrase pools instead, which is what earlier versions did — see §5.4. |
 | FOLDER | REMEMBER / REFRESH | With REMEMBER, a sample load reopens at the folder you last loaded a sample from, for as long as the app is running. With REFRESH it always starts at the default (or at whatever `config.json` names — see section 26). |
-| NOTE PREV | ON / OFF | Play the note at its pitch when you insert it on the PHRASE screen — useful for hearing what you're placing without pressing START. |
+| NOTE PREV | ON / OFF | On the PHRASE screen, play the note under the cursor for as long as you hold **A** — when you insert it, change it with A + D-pad, or just hold A on it. Not in selection mode. |
 | VISUALIZER | SCOPE / FLAT / OCTA / OCTA.F / SPECT / SPCT.P | Visualizer mode for the top bar (see §3 for descriptions). |
 | THEME | theme name > | Shows the current theme name. Press A to open the THEME EDITOR. |
 | TEMPLATE | SAVE / CLEAR | SAVE stores the current project as a template for new projects. CLEAR removes the saved template. |

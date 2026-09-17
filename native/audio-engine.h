@@ -133,6 +133,14 @@ public:
     // failure (incl. unsupported extension). AAC containers are handled here now — nothing needs MediaCodec.
     int loadSampleFromCompressed(int id, const char* path);
     bool hasStereoData(int id);
+    // The bit depth the slot's audio came in at: 8/16/24/32 for a WAV, the STREAMINFO depth for a FLAC,
+    // and 16 for everything else (a lossy decode has no depth of its own). The sample editor's BIT cell
+    // offers this and lower, and SAVE writes it. `isSampleFloat` is true only for a 32-bit float WAV.
+    int  getSampleBitDepth(int id) const;
+    bool isSampleFloat(int id) const;
+    // After SAVE: the buffer IS the file now. Record the depth it was written at, and drop the RATE/BIT
+    // original — it describes audio that is no longer the sample's starting point.
+    void adoptSavedSampleFormat(int id, int bits, bool isFloat);
     void clearAllSamples();
     // Free all buffers for a single slot (used when a slot is repurposed, e.g. sampler → SoundFont).
     void clearSample(int id);
@@ -230,7 +238,28 @@ public:
     void setInstrumentFrameWindow(int instrumentId, int startFrame, int endFrame);
 
     void stopTrack(int trackId);
+
+    /**
+     * End every sounding voice IMMEDIATELY. Nobody is listening when this is called: the render path
+     * runs it to clear the previous take out of the engine before it schedules, and the whole point
+     * there is that no audio from before the call may reach the output. The transport uses
+     * stopAllRamped() instead.
+     */
     void stopAll();
+
+    /**
+     * The STOP BUTTON's version — the same end state, reached over KILL_FADE_SAMPLES instead of in
+     * one sample. A sustained note ended where its waveform happened to be is a full-scale step, and
+     * the master bus obligingly carries it: OTT and DUST both compress, which lifts it further.
+     *
+     * Both pools ramp, and each ramp sits where that pool's audio is already fully formed — after the
+     * instrument's filter and above the reverb/delay send tap — so the tails are fed a signal that
+     * fades rather than one that stops mid-cycle and rings the click on for seconds.
+     *
+     * ⚠️ The ramp is finished by the AUDIO thread: this call only arms it, so the voices are still
+     * sounding when it returns. Anything that must be silent immediately wants stopAll().
+     */
+    void stopAllRamped();
 
     // Platform hook: the audio shell installs a callback that restarts the output stream if the
     // platform paused it (Oboe today; ALSA/SDL on Linux). The Kotlin path called
@@ -314,8 +343,11 @@ public:
     void prepareSourcePreview(int dstId, int srcId, int mode);
     int  getClipboardLength();
     void downsampleSample(int id, int factor);
-    // Non-destructive rate mode: derives buffer from cached original (factor 1=HIGH,2=NORM,4=LOFI).
-    void applyRateMode(int id, int factor);
+    // The sample editor's RATE and BIT cells: derives the buffer from the cached original, decimated by
+    // `factor` (1=HIGH, 2=NORM, 4=LOFI) and then quantised to `bits` (32, 24, 16 or 8, never above the
+    // sample's own depth). One derive for both, so changing either never discards the other. (1, the
+    // sample's own depth) restores the original.
+    void applyRateAndBits(int id, int factor, int bits);
     // Destructive pitch shift by semitones (applied to buffer in-place; clears original cache).
     void pitchShiftSample(int id, float semitones);
     // Destructive time-stretch: ratio > 1 = longer/slower, < 1 = shorter/faster. SOLA algorithm.
@@ -844,7 +876,17 @@ private:
     int    fxPreviewBackupId    = -1;
     int16_t* originalSamples[256];      // cached HIGH-rate original for non-destructive RATE mode (left, int16 — see above)
     int16_t* originalSamplesRight[256]; // cached HIGH-rate original (right channel; null = mono)
+    // ⚠️ The same cache in FLOAT, used INSTEAD of the int16 pair when the sample is deeper than 16 bits —
+    // an int16 copy of a 24-bit sample would make "back to 24" hand back 16 bits. At most one pair is
+    // ever allocated for a slot; `freeRateCache` is the one place that frees both.
+    float*   originalSamplesF[256];
+    float*   originalSamplesRightF[256];
     int      originalSampleLengths[256];
+    uint8_t  sampleBitDepth[256];       // see getSampleBitDepth
+    bool     sampleIsFloat[256];
+    void     freeRateCache(int id);
+    // Every "a new file replaced this slot" site: its depth, and no RATE/BIT original left over.
+    void     setSampleSourceFormat(int id, int bits, bool isFloat);
     std::mutex sampleEditMutex;       // held during buffer swap; try-locked in voice mix loop
     float* sampleClipboard      = nullptr; // cross-operation copy/paste buffer (left)
     float* sampleClipboardRight = nullptr; // copy/paste buffer (right channel; null = mono clip)
@@ -963,6 +1005,11 @@ private:
     // getCurrentFrame() JNI — atomic (relaxed) makes that formally race-free at zero cost on arm64
     // and keeps the planned Linux port correct on unknown hardware.
     std::atomic<int64_t> globalFrameCounter{0};  // Total frames processed since start
+
+    // The frame the transport-stop ramp is over at, or −1 when no stop is in flight. Armed by
+    // stopAllRamped() (UI thread), consumed by processAudioBlock, which is where the reason it has
+    // to exist at all is written down.
+    std::atomic<int64_t> stopRampEndFrame{-1};
 
     // Session entropy mixed into per-note RNG seeds (RND/DRNK LFO). Reseeded from the wall
     // clock at construction and at every resetFrameCounter() (= offline-render start): seeds

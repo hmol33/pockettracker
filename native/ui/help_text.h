@@ -340,6 +340,7 @@ enum class HelpTopic {
     FX_REVERB_ALGO,
     FX_REVERB_DECAY,
     FX_REVERB_DENSITY,
+    SE_BIT,
 
     COUNT
 };
@@ -630,7 +631,7 @@ inline constexpr HelpEntry HELP_ENTRIES[] = {
     /* SET_FOLDER */
     {"FOLDER: where a load opens", "REMEMBER returns to the last", "folder used, REFRESH resets."},
     /* SET_NOTE_PREVIEW */
-    {"NOTE PREV: hear what you type", "Plays the note as you enter", "it in a phrase."},
+    {"NOTE PREV: hear what you type", "A phrase note plays for as", "long as you hold A on it."},
     /* SET_VISUALIZER */
     {"VISUALIZER: the top strip", "A scope, a meter per track,", "or a spectrum."},
     /* SET_THEME */
@@ -825,6 +826,8 @@ inline constexpr HelpEntry HELP_ENTRIES[] = {
     {"DCAY: how long it rings", "MVERB only. Separate from the", "room, so a small one can ring."},
     /* FX_REVERB_DENSITY */
     {"DENS: how thick it is", "MVERB only. Low is grainy and", "sparse, high is smooth."},
+    /* SE_BIT */
+    {"BIT: bits per sample", "The file depth, or lower for", "grit. SAVE writes at this depth."},
 };
 
 // ─── The compile-time check on the table ─────────────────────────────────────────────────────────
@@ -1283,7 +1286,7 @@ inline HelpTopic sample_editor_cell_topic(int row, int column, int slice_method)
         case 2:
             if (column == 0) return HelpTopic::SE_PITCH;
             if (column == 1) return HelpTopic::SE_DURATION;
-            return (column == 2) ? HelpTopic::SE_SNAP : HelpTopic::NONE;
+            return (column == 2) ? HelpTopic::SE_BIT : HelpTopic::NONE;
 
         // Rows 3..8 are all the SELECTION: the cursor only ever rests on 8, but the D-pad drags an
         // edge from any of them, and column is which edge.

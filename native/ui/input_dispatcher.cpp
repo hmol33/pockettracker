@@ -548,18 +548,20 @@ bool InputDispatcher::apply_edit(const InputAction& action) {
             const PhraseInputResult r = phrase_.handle_input(ph, s_.cursorRow, s_.cursorColumn, action);
             if (!r.modified) return false;
 
-            // The "last edited" memory + the audition, exactly where Kotlin does them. Note the two
-            // guards: the STEP must have a note (editing the velocity of an empty step remembers
-            // nothing), and only an edit to the NOTE column auditions — dialling a velocity should
-            // not retrigger the voice under your fingers.
-            if (r.hasNote || r.hasVolume || r.hasInstrument) {
-                const songcore::PhraseStep& step = ph.steps[static_cast<size_t>(s_.cursorRow)];
-                if (step.note != Note::EMPTY()) {
-                    s_.lastEditedNote       = step.note;
-                    s_.lastEditedVolume     = step.volume;
-                    s_.lastEditedInstrument = step.instrument;
-                    if (s_.settings.notePreviewEnabled && r.hasNote) preview_edited_note();
-                }
+            // The "last edited" memory + the audition. Note the two guards: the STEP must have a note
+            // (editing the velocity of an empty step remembers nothing), and only an edit to the NOTE
+            // column auditions — dialling a velocity should not retrigger the voice under your fingers.
+            const songcore::PhraseStep& step = ph.steps[static_cast<size_t>(s_.cursorRow)];
+            if ((r.hasNote || r.hasVolume || r.hasInstrument) && step.note != Note::EMPTY()) {
+                s_.lastEditedNote       = step.note;
+                s_.lastEditedVolume     = step.volume;
+                s_.lastEditedInstrument = step.instrument;
+                if (r.hasNote) preview_held_note();
+            }
+            // A+B under a held audition: the note it was playing is gone, so is the sound.
+            if (heldNotePreview_ && step.note == Note::EMPTY()) {
+                heldNotePreview_ = false;
+                host_.stop_preview();
             }
             return true;
         }
@@ -663,7 +665,7 @@ bool InputDispatcher::apply_edit(const InputAction& action) {
 
         case ScreenType::SAMPLE_EDITOR: {
             const SampleEditorInputResult r = sample_.handle_input(s_.sampleEditor, action);
-            if (r.rateModeChanged) apply_sample_rate_mode();
+            if (r.rateModeChanged || r.bitDepthChanged) apply_sample_rate_and_bits();
 
             // ⚠️ `false`, and it is the honest answer rather than a shortcut. This function's question is
             // "did the LIVE DOCUMENT change?", and the sample editor's session state is not the document:
@@ -673,8 +675,8 @@ bool InputDispatcher::apply_edit(const InputAction& action) {
             // on the ZOOM cell, rolling the lookahead back sixty times a second under a playing song, for
             // an edit that did not change a single audible thing.
             //
-            // The one edit here that DOES reach the engine is RATE, which re-decimates the buffer — and it
-            // says so itself, in `apply_sample_rate_mode()` above, exactly where Kotlin says it.
+            // The edits here that DO reach the engine are RATE and BIT, which rebuild the buffer — and
+            // they say so themselves, in `apply_sample_rate_and_bits()` above.
             return false;
         }
 
@@ -764,15 +766,18 @@ int InputDispatcher::audition_track() const {
     return refs[static_cast<size_t>(s_.songCursorRow)] >= 0 ? track : -1;
 }
 
-void InputDispatcher::preview_edited_note() {
+void InputDispatcher::preview_held_note() {
+    if (!s_.settings.notePreviewEnabled || s_.selection.active) return;
+    if (s_.currentScreen != ScreenType::PHRASE || s_.cursorColumn != 1) return;
+
     const Project& p = *s_.project;
     const songcore::PhraseStep& step =
         p.phrases[static_cast<size_t>(s_.currentPhrase)].steps[static_cast<size_t>(s_.cursorRow)];
+    if (step.note == Note::EMPTY()) return;
 
-    const int sr = std::max(44100, host_.sample_rate());
     host_.set_preview_track(audition_track());
-    host_.preview_note(std::min(std::max(step.instrument, 0), 127), step.note,
-                       songcore::frames_per_step(p.tempo, sr));
+    host_.preview_note(std::min(std::max(step.instrument, 0), 127), step.note, /*durationFrames=*/0);
+    heldNotePreview_ = true;
 }
 
 // ─── The three generic paths ─────────────────────────────────────────────────────────────────────
@@ -1379,6 +1384,13 @@ void InputDispatcher::on_a_right() {
 }
 
 void InputDispatcher::on_a_released() {
+    // Ahead of the overlay test: it is not an overlay's gesture, and nothing can start a second
+    // preview while A is down (START is refused under A), so this can only silence the one A began.
+    if (heldNotePreview_) {
+        heldNotePreview_ = false;
+        host_.stop_preview();
+    }
+
     // The FX helper commits on RELEASE, not on a press — which is what lets you hold A, read the
     // description of half a dozen effects, and let go on the one you want.
     if (top_overlay() != Overlay::FX_HELPER) return;
@@ -1524,8 +1536,12 @@ void InputDispatcher::on_a_a() {
     // A double-tap is only a double-tap if the cursor has not moved between the presses. Anything
     // else is two separate A presses, and each of those already did something (they inserted the
     // LAST-EDITED item — see on_button_a).
+    //
+    // ⚠️ The PHRASE audition is owed on BOTH exits. A second A inside 300 ms lands here and never
+    // reaches `on_button_a`, so a quick re-press on a note would otherwise be held in silence.
     if (!hasInsertPos_ || insertScreen_ != s_.currentScreen || insertRow_ != s_.cursorRow ||
         insertCol_ != s_.cursorColumn) {
+        preview_held_note();
         return;
     }
     hasInsertPos_ = false;
@@ -1571,11 +1587,12 @@ void InputDispatcher::on_a_a() {
         const int next  = first_from_wrapping(s_.lastEditedInstrument + 1, count, [&](int i) {
             return songcore::instrument_is_free(p.instruments[static_cast<size_t>(i)]);
         });
-        if (next < 0) return;
-
-        step.instrument         = next;
-        s_.lastEditedInstrument = next;
-        mark_modified();
+        if (next >= 0) {
+            step.instrument         = next;
+            s_.lastEditedInstrument = next;
+            mark_modified();
+        }
+        preview_held_note();
     }
 }
 
@@ -2222,7 +2239,7 @@ void InputDispatcher::on_l_r() {
 
     // ── ONE PRESS UNDOES ONE THING, MOST RECENT FIRST ────────────────────────────────────────────
     //
-    // Two rungs: the mix (any track muted or soloed) and the selection with its buffer.
+    // Two rungs: the mix (any mixer channel muted or soloed) and the selection with its buffer.
     // `s_.lastClearable` says which the user touched last, and that one is tried first — clearing
     // both at once would throw away a selection someone built press by press just because they also
     // dropped a channel out of the mix.
@@ -2234,11 +2251,17 @@ void InputDispatcher::on_l_r() {
     // ⚠️ The SAMPLE_EDITOR exclusion covers this rung too, for the reason it covers the clipboard's:
     // L+R is reserved there for the editor's own selection, and one screen with two exclusion lists
     // is a special case someone has to remember.
+    //
+    // ⚠️ Asked over all MIX_CHANNELS through `mix_channel_flags` — the resolver the chord toggles with —
+    // so the REV and DEL strips count. A walk over `p.tracks` alone leaves a return muted on its own
+    // with no L+R to bring it back.
     const bool mix_touched = [&] {
         if (s_.currentScreen == ScreenType::SAMPLE_EDITOR) return false;
-        const Project& p = host_.project();
-        for (const songcore::Track& t : p.tracks)
-            if (t.mute || t.solo) return true;
+        Project& p = host_.edit_project();   // the resolver hands out pointers; nothing is written here
+        for (int ch = 0; ch < MIX_CHANNELS; ++ch) {
+            const songcore::MixChannelFlags f = songcore::mix_channel_flags(p, ch);
+            if (f.mute && (*f.mute || *f.solo)) return true;
+        }
         return false;
     }();
 
@@ -2501,7 +2524,12 @@ void InputDispatcher::reset_editing_context() {
     s_.cursorRow = 0; s_.cursorColumn = 1;
     s_.songScrollPosition = 0;
     s_.instrumentCursorRow = 0; s_.instrumentCursorColumn = 1;
+    // ⚠️ BOTH halves of the mixer cursor, and the row is not optional. Resetting the column alone left
+    // the pair at (OTT, track 0) or (LIM, track 0) — rows that exist only in the master strip, over a
+    // column that has no such row. Nothing draws highlighted there and no edit dispatches: load a
+    // project with the cursor down the master strip and the mixer came back with no cursor on it.
     s_.mixerCursorColumn = 0;
+    s_.mixerMasterRow    = 0;
     s_.effectsCursorRow  = 0;
     s_.tableCursorRow = 0; s_.tableCursorColumn = 1;
     s_.grooveCursorRow = 0;
@@ -2514,9 +2542,9 @@ void InputDispatcher::reset_editing_context() {
     s_.chainCursorRow = 0;  s_.chainCursorColumn = 1;
     s_.phraseCursorRow = 0; s_.phraseCursorColumn = 1;
 
-    // ⚠️ NOT mixerMasterRow, NOT the SETTINGS cursor, NOT poolCursorColumn: Kotlin leaves all three
-    // alone (the pool's ROW is currentInstrument, which IS reset above). Match the quirk exactly —
-    // ptdispatch §32 pins the negatives too.
+    // ⚠️ NOT the SETTINGS cursor and NOT poolCursorColumn: both persist, and both survive it — the
+    // pool's ROW is currentInstrument, which IS reset above, and SETTINGS has a visibility guard of
+    // its own on entry. The mixer ROW is reset with its column because those two are one address.
     s_.selection = Selection{};
 
     // ⚠️ …AND UNDER NAV = SONG THE THREE REMEMBER SLOTS ABOVE ARE THE POINTER, so "reset to 0" aims it
@@ -3127,7 +3155,11 @@ void InputDispatcher::on_button_a() {
             PhraseEditorState ps{ph};
             ps.cursorRow    = s_.cursorRow;
             ps.cursorColumn = s_.cursorColumn;
-            if (!phrase_.cursor_context(ps).capabilities.isEmpty) return;
+            // A on a note that is already there inserts nothing, but holding it is how you listen.
+            if (!phrase_.cursor_context(ps).capabilities.isEmpty) {
+                preview_held_note();
+                return;
+            }
 
             songcore::PhraseStep& step = ph.steps[static_cast<size_t>(s_.cursorRow)];
             step.note       = s_.lastEditedNote;
@@ -3143,14 +3175,7 @@ void InputDispatcher::on_button_a() {
             insertRow_    = s_.cursorRow;
             insertCol_    = s_.cursorColumn;
 
-            if (s_.settings.notePreviewEnabled && step.note != Note::EMPTY()) {
-                // A WHOLE PHRASE long, not one step: this gesture lays a note down to listen to, and
-                // an audition that dies after a 16th note tells you nothing about a pad.
-                const int sr = std::max(44100, host_.sample_rate());
-                host_.set_preview_track(audition_track());
-                host_.preview_note(std::min(std::max(step.instrument, 0), 127), step.note,
-                                   songcore::frames_per_step(p.tempo, sr) * 16);
-            }
+            preview_held_note();
             break;
         }
 
@@ -4497,6 +4522,9 @@ void InputDispatcher::init_sample_editor_state() {
     se.totalFrames   = host_.sample_length(se.instrumentId);
     se.sampleRate    = host_.sample_rate_of(se.instrumentId);
     se.hasStereoData = host_.has_stereo_data(se.instrumentId);
+    // BIT opens at the sample's own depth, which is also the highest it can offer.
+    se.sourceBitDepth = host_.sample_bit_depth(se.instrumentId);
+    se.bitDepth       = se.sourceBitDepth;
 
     // ⚠️ SOURCE OPENS ON STEREO FOR A STEREO SAMPLE, and this is a SAVE decision rather than a display
     // one. The mode is what `resolve_save_channels` reads: every value but STEREO writes a ONE-CHANNEL
@@ -4856,14 +4884,14 @@ void InputDispatcher::tap_slice_marker() {
     select_current_slice();
 }
 
-// ─── RATE: the destructive one on row 1 ──────────────────────────────────────────────────────────
+// ─── RATE and BIT: the two cells that rebuild the audio ──────────────────────────────────────────
 
-void InputDispatcher::apply_sample_rate_mode() {
+void InputDispatcher::apply_sample_rate_and_bits() {
     SampleEditorState& se     = s_.sampleEditor;
     const int          factor = (se.rateMode == 1) ? 2 : (se.rateMode == 2) ? 4 : 1;
     const int          oldLen = se.totalFrames;
 
-    host_.apply_rate_mode(se.instrumentId, factor);
+    host_.apply_rate_and_bits(se.instrumentId, factor, se.bitDepth);
 
     // ⚠️ The 2-phrase lookahead has ALREADY scheduled notes against the OLD base frequency — they would
     // play the re-decimated buffer at double or half pitch. Rolling the schedule back is what makes the
@@ -5090,6 +5118,11 @@ void InputDispatcher::sample_editor_confirm() {
                 };
                 se.slicePosition = scale(se.slicePosition);
                 if (clear_pitch) se.pitchSemitones = 0;
+                // ⚠️ Both resamplers drop the engine's RATE/BIT original — the result IS the new
+                // original. Left at NORM or LOFI, RATE would describe a cache that no longer exists,
+                // and its next touch would decimate the audio a second time. BIT is KEPT: it is also
+                // the depth SAVE writes, and rounding a second time to the same grid changes nothing.
+                se.rateMode     = 0;
                 refresh_sample_view(/*reset_selection=*/true);
                 se.isModified = true;
             };
@@ -5211,6 +5244,7 @@ void InputDispatcher::bake_pending_pitch() {
     se.totalFrames    = newLen;
     se.pitchSemitones = 0;   // spent
     se.rateMode       = 0;   // the shifted buffer IS the new original — see sample_edit.h
+    // ⚠️ BIT is NOT reset. This runs on the way INTO a save, and BIT is the depth that save writes.
     se.waveformData   = host_.sample_waveform(se.instrumentId, WAVEFORM_BINS, 0, 0,
                                               waveform_channel(se.sourceMode));
 
@@ -5284,11 +5318,13 @@ void InputDispatcher::save_sample_to(const std::string& path, bool adopt_name) {
     SampleEditorState& se   = s_.sampleEditor;
     const std::vector<int> cues = compute_slice_cue_points();
 
-    if (!host_.save_sample_wav(se.instrumentId, path, cues, se.sourceMode, se.hasStereoData)) {
+    if (!host_.save_sample_wav(se.instrumentId, path, cues, se.sourceMode, se.hasStereoData,
+                               se.bitDepth)) {
         s_.statusMessage = "SAVE FAILED";
         s_.statusSuccess = false;
         return;
     }
+    host_.adopt_saved_sample(se.instrumentId, se.bitDepth);
 
     // ⚠️ A MONO save is re-loaded from the file it just wrote, and that is not belt-and-braces. The
     // editor's buffer may still be STEREO (SOURCE=LEFT writes one channel of a two-channel sample), and
@@ -5340,7 +5376,7 @@ void InputDispatcher::sample_editor_chop() {
     fs_.create_folder(chops, base);
     const std::string dir = chops + "/" + base;
 
-    const int written = host_.chop_sample(se.instrumentId, dir, base, slices);
+    const int written = host_.chop_sample(se.instrumentId, dir, base, slices, se.bitDepth);
     s_.statusMessage   = written > 0 ? ("CHOPPED " + std::to_string(written)) : "CHOP FAILED";
     s_.statusSuccess   = written > 0;
 }

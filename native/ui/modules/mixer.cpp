@@ -15,15 +15,33 @@ constexpr int FIRST_METER_X  = 10;
 
 constexpr int TRACK_METER_TOP = 24;
 constexpr int TRACK_METER_H   = 155;
-constexpr int TRACK_VOL_Y     = 182;   // TRACK_METER_TOP + TRACK_METER_H + 3
 
 constexpr int MASTER_METER_H  = 200;   // taller than a track's; same top
+
+// Background left between a meter's outline and the text row beside it — the same 3px a row already
+// pads its glyphs with, so the meter reads as one more row edge. Every text row that borders a meter
+// derives its baseline from the two helpers below, which is what keeps tracks, master and sends
+// clearing their outline by the identical amount; a lit cursor cell, 3px taller than its glyphs on
+// each side, still lands clear of it.
+constexpr int METER_TEXT_GAP = 3;
+
+/** Text baseline for a row sitting UNDER a meter of height `meter_h` that starts at `meter_top`. */
+constexpr int text_y_under(int meter_top, int meter_h) {
+    return meter_top + meter_h + 1 + METER_TEXT_GAP + TEXT_PADDING;
+}
+
+/** Text baseline for a row sitting ABOVE a meter that starts at `meter_top`. */
+constexpr int text_y_above(int meter_top) {
+    return meter_top - 1 - METER_TEXT_GAP - ROW_HEIGHT + TEXT_PADDING;
+}
+
+constexpr int TRACK_VOL_Y = text_y_under(TRACK_METER_TOP, TRACK_METER_H);   // 186
 
 // The send returns sit under the tracks: headers ABOVE the meters, wet values BELOW them.
 constexpr int SEND_METER_TOP = 234;
 constexpr int SEND_METER_H   = 112;
-constexpr int SEND_HEADER_Y  = 216;
-constexpr int SEND_VALUE_Y   = 350;
+constexpr int SEND_HEADER_Y  = text_y_above(SEND_METER_TOP);                 // 212
+constexpr int SEND_VALUE_Y   = text_y_under(SEND_METER_TOP, SEND_METER_H);   // 353
 
 // Every stereo pair — tracks, master and sends alike — is two slim bars with a 1px gutter.
 constexpr int BAR_W   = 20;
@@ -31,11 +49,11 @@ constexpr int BAR_SEP = 1;
 
 constexpr int MASTER_X = FIRST_METER_X + 8 * METER_SPACING;   // 434
 
-// The master strip's four value rows, starting level with the send meters.
-constexpr int MROW0_Y = TRACK_METER_TOP + MASTER_METER_H + 10;  // 234
-constexpr int MROW1_Y = MROW0_Y + ROW_HEIGHT;                   // 255
-constexpr int MROW2_Y = MROW1_Y + ROW_HEIGHT;                   // 276
-constexpr int MROW3_Y = MROW2_Y + ROW_HEIGHT;                   // 297
+// The master strip's four value rows, hanging off the bottom of its own (taller) meter.
+constexpr int MROW0_Y = text_y_under(TRACK_METER_TOP, MASTER_METER_H);  // 231
+constexpr int MROW1_Y = MROW0_Y + ROW_HEIGHT;                           // 252
+constexpr int MROW2_Y = MROW1_Y + ROW_HEIGHT;                           // 273
+constexpr int MROW3_Y = MROW2_Y + ROW_HEIGHT;                           // 294
 
 constexpr int MSTR_LABEL_X = MASTER_X - 65;   // 369
 constexpr int MSTR_VALUE_X = MASTER_X + 5;    // 439
@@ -47,6 +65,11 @@ constexpr int SEG_STEP = SEG_H + SEG_GAP;
 
 /** How many peak refreshes the marker hangs before it starts to fall. See mixer.h on what a "frame" is. */
 constexpr int PEAK_HOLD_FRAMES = 45;
+
+// The longest fall there is: the hold, then one segment per refresh down the tallest meter. Replaying
+// more refreshes than this in one draw cannot move a marker that is already on the trough.
+constexpr unsigned MAX_HOLD_STEPS =
+    static_cast<unsigned>(PEAK_HOLD_FRAMES + MASTER_METER_H / SEG_STEP);
 
 // Zone boundaries as a fraction of meter height from the bottom. The meter spans −42..+6 dBFS (48 dB),
 // so −12 dB is 30/48 up it and 0 dB is 42/48. Fixed to the METER, not to the signal: a green segment is
@@ -81,8 +104,13 @@ void MixerModule::draw(Canvas& c, int x, int y, const MixerState& s) {
 
     // ⚠️ The hold advances once per PEAK REFRESH, not once per draw — see the header. A redraw caused by
     // a cursor move (which happens between polls) must not age the peak markers.
-    const bool advance = (s.peaksVersion != lastPeaksVersion_);
-    lastPeaksVersion_  = s.peaksVersion;
+    //
+    // It ages by as many refreshes as the version has moved, not by one: the feed replays the refreshes
+    // that went by while this screen was away (or under an overlay), and a marker caught mid-fall has to
+    // land where that clock says rather than resume from where it parked. Unsigned wrap makes the
+    // `-1` sentinel give exactly one step on the first draw.
+    const unsigned steps = std::min(s.peaksVersion - lastPeaksVersion_, MAX_HOLD_STEPS);
+    lastPeaksVersion_    = s.peaksVersion;
 
     c.fill_rect(x, y, WIDTH, HEIGHT, t.background);
     c.draw_text("MIXER", x + 10, y + TEXT_PADDING, t.textTitle, CHAR_SPACING, FONT_SCALE);
@@ -97,16 +125,12 @@ void MixerModule::draw(Canvas& c, int x, int y, const MixerState& s) {
         // fader value both say so.
         const bool audible = track_audible(p, i) && dry_audible(p);
 
-        // ⚠️ THE FADER CELL IS PAINTED BEFORE ITS METER, and the order is load-bearing: the volume sits
-        // 2px under the meter, one short of a row's own 3px of padding, so the cell's top row lands on
-        // the meter's bottom BORDER. Drawn after, it would take a 36px bite out of the bright frame
-        // that says which strip is selected. The meter overdraws that one row instead.
-        draw_cursor_cell(c, hex2(p.tracks[static_cast<size_t>(i)].volume), mX + 5, y + TRACK_VOL_Y,
-                         isSel, audible ? t.textValue : t.textEmpty, t);
-
         draw_stereo_meter(c, mX, y + TRACK_METER_TOP, TRACK_METER_H, peak_at(s.trackPeaks, i * 2),
                           peak_at(s.trackPeaks, i * 2 + 1), isSel, /*is_muted=*/!audible,
-                          t, i * 2, i * 2 + 1, advance);
+                          t, i * 2, i * 2 + 1, steps);
+
+        draw_cursor_cell(c, hex2(p.tracks[static_cast<size_t>(i)].volume), mX + 5, y + TRACK_VOL_Y,
+                         isSel, audible ? t.textValue : t.textEmpty, t);
     }
 
     // ── The master meter ─────────────────────────────────────────────────────────────────────────
@@ -116,7 +140,7 @@ void MixerModule::draw(Canvas& c, int x, int y, const MixerState& s) {
     const bool masterSel = (s.cursorColumn == 8);
     draw_stereo_meter(c, x + MASTER_X, y + TRACK_METER_TOP, MASTER_METER_H,
                       peak_at(s.masterPeaks, 0), peak_at(s.masterPeaks, 1), masterSel,
-                      /*is_muted=*/false, t, 16, 17, advance);
+                      /*is_muted=*/false, t, 16, 17, steps);
 
     // ── The two send returns, side by side under the tracks ──────────────────────────────────────
     const bool revSendSel = (s.mixerMasterRow == 1 && s.cursorColumn == 0);
@@ -129,10 +153,10 @@ void MixerModule::draw(Canvas& c, int x, int y, const MixerState& s) {
 
     draw_stereo_meter(c, x + FIRST_METER_X, y + SEND_METER_TOP, SEND_METER_H,
                       peak_at(s.reverbPeaks, 0), peak_at(s.reverbPeaks, 1), revSendSel,
-                      /*is_muted=*/!revAudible, t, 18, 19, advance);
+                      /*is_muted=*/!revAudible, t, 18, 19, steps);
     draw_stereo_meter(c, x + FIRST_METER_X + METER_SPACING, y + SEND_METER_TOP, SEND_METER_H,
                       peak_at(s.delayPeaks, 0), peak_at(s.delayPeaks, 1), delSendSel,
-                      /*is_muted=*/!delAudible, t, 20, 21, advance);
+                      /*is_muted=*/!delAudible, t, 20, 21, steps);
 
     // Both labels are centred on their meter pair: half the pair's width, less half the text's.
     const int revCX = x + FIRST_METER_X + (BAR_W + BAR_SEP + BAR_W) / 2;
@@ -184,7 +208,7 @@ void MixerModule::draw(Canvas& c, int x, int y, const MixerState& s) {
 
 void MixerModule::draw_stereo_meter(Canvas& c, int x, int y, int h, float level_l, float level_r,
                                     bool is_selected, bool is_muted, const Theme& t, int peak_idx_l,
-                                    int peak_idx_r, bool advance) {
+                                    int peak_idx_r, unsigned steps) {
     const Argb border = is_selected ? t.textCursor : t.meterBorder;
     const int  rX     = x + BAR_W + BAR_SEP;
 
@@ -196,7 +220,9 @@ void MixerModule::draw_stereo_meter(Canvas& c, int x, int y, int h, float level_
     const int lhPx = level_to_height_px(level_l, h);
     const int rhPx = level_to_height_px(level_r, h);
 
-    if (advance) {
+    // Replaying a step with the level held is what the missed refreshes did anyway: past the first, the
+    // fall is a function of the counter alone.
+    for (unsigned i = 0; i < steps; ++i) {
         update_peak(peak_idx_l, lhPx, is_muted);
         update_peak(peak_idx_r, rhPx, is_muted);
     }
