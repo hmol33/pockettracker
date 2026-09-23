@@ -1,0 +1,26 @@
+name: Gource xvgfb test
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xvfb
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11-utils
+      - name: Start Xvfb and test
+        run: |
+          Xvfb :99 -screen 0 1024x768x24 -ac &
+          sleep 2
+          export DISPLAY=:99
+          echo "Trying xset..."
+          if xset q >/dev/null 2>&1; then
+            echo "X server OK"
+          else
+            echo "X server NOT OK"
+            exit 1
+          fi
+          echo "Trying gource..."
+          timeout 15 gource --max-files 100 --key -800x600 --output-framerate 25 -s 0.6 --stop-at-end --hide mouse,progress -o /tmp/test.ppm . 2>&1 | tail -5
+          echo "gource exit: $?"
+          ls -la /tmp/test.ppm || echo "no ppm"
